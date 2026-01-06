@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from dotenv import load_dotenv
 import asyncpg
 
 from telegram import (
@@ -24,6 +25,7 @@ from telegram.ext import (
 # -------------------------
 # Configuration
 # -------------------------
+load_dotenv('.env')
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/subscription_bot")
 PORT = int(os.getenv("PORT", "8080"))
