@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from telegram import Update, BotCommand
 from telegram.ext import (
@@ -35,37 +36,50 @@ from handlers import (
 
 def setup_logging():
     """Configure logging with file rotation"""
+    import os
+    from pathlib import Path
+    
     # Create formatters
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
-
-    # Console handler
+    
+    # Console handler (always enabled)
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     console_handler.setLevel(getattr(logging, Config.LOG_LEVEL))
-
-    # File handler with rotation
-    file_handler = RotatingFileHandler(
-        Config.LOG_FILE,
-        maxBytes=Config.LOG_MAX_BYTES,
-        backupCount=Config.LOG_BACKUP_COUNT,
-        encoding='utf-8'
-    )
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(logging.DEBUG)  # Log everything to file
-
+    
     # Root logger configuration
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
     root_logger.addHandler(console_handler)
-    root_logger.addHandler(file_handler)
-
+    
+    # File handler ONLY for local development (not on Railway/production)
+    if os.getenv('RAILWAY_ENVIRONMENT') is None:  # Not on Railway
+        try:
+            # Create log directory if it doesn't exist
+            log_dir = Path(Config.LOG_DIR)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            
+            # File handler with rotation
+            file_handler = RotatingFileHandler(
+                Config.LOG_FILE,
+                maxBytes=Config.LOG_MAX_BYTES,
+                backupCount=Config.LOG_BACKUP_COUNT,
+                encoding='utf-8'
+            )
+            file_handler.setFormatter(formatter)
+            file_handler.setLevel(logging.DEBUG)
+            root_logger.addHandler(file_handler)
+        except Exception as e:
+            print(f"Warning: Could not set up file logging: {e}")
+    
     # Reduce noise from libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.INFO)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
 
 
 # Get logger for this module
