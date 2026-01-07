@@ -1,449 +1,374 @@
-# 🚀 Telegram Bot Deployment Guide
+# 🤖 Telegram Subscription Management Bot
 
-## Step-by-Step Instructions
+A professional, modular Telegram bot for managing subscription plans with PostgreSQL backend, admin panel, and comprehensive CRUD operations.
 
-### 📋 Prerequisites
+[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Telegram Bot API](https://img.shields.io/badge/Telegram%20Bot%20API-20.7-blue.svg)](https://python-telegram-bot.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-13+-316192.svg)](https://www.postgresql.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-1. **Server with Docker installed** (VPS, DigitalOcean, AWS EC2, etc.)
-2. **Telegram Bot Token** from @BotFather
+## ✨ Features
 
----
+### Core Functionality
+- 👤 **User Management** - Account creation with email validation
+- 💳 **Subscription Plans** - Multiple tiers (Standard, Pro, Business+, Enterprise+)
+- ⏰ **Status Tracking** - Real-time subscription status and days remaining
+- 📊 **Plan Details** - Detailed information for each subscription tier
+- 🎨 **Modern UI** - Glass-style button interface
 
-## 🎯 Part 1: Get Your Bot Token
+### Admin Features
+- 🔐 **Admin Panel** - Dedicated control panel for administrators
+- 📈 **Statistics** - User and subscription analytics
+- 💾 **Backup & Restore** - JSON-based database backups
+- 👥 **User Management** - View and manage users
+- 🔄 **Subscription Control** - Expire or cancel subscriptions
 
-1. Open Telegram and search for **@BotFather**
-2. Send command: `/newbot`
-3. Choose a name for your bot (e.g., "My Subscription Bot")
-4. Choose a username (must end with 'bot', e.g., "mysubscription_bot")
-5. Copy the **API token** you receive (looks like: `1234567890:ABCdefGHIjklMNOpqrsTUVwxyz`)
+### Technical Features
+- 🏗️ **Modular Architecture** - Separated concerns (handlers, keyboards, database)
+- 🔄 **Auto Schema Init** - Automatic database initialization with fallback
+- 📝 **Comprehensive Logging** - File rotation and proper error tracking
+- ⚙️ **Background Jobs** - Auto-expiration and scheduled backups
+- 🛠️ **CLI Tools** - Command-line utilities for management
+- 🔒 **Connection Pooling** - Efficient async database connections
 
----
+## 📁 Project Structure
 
-## 🐳 Part 2: Deploy with Docker
-
-### Method A: Deploy on VPS (DigitalOcean, AWS, etc.)
-
-#### 1️⃣ Connect to Your Server
-```bash
-ssh root@your-server-ip
+```
+drelegrambot/
+├── src/
+│   ├── __init__.py          # Package initialization
+│   ├── config.py            # Configuration management
+│   ├── database.py          # Database CRUD operations
+│   ├── keyboards.py         # Telegram keyboard layouts
+│   ├── handlers.py          # Command and callback handlers
+│   └── main.py              # Application entry point
+├── backups/                 # Database backups (auto-created)
+├── logs/                    # Application logs (auto-created)
+├── utils.py                 # CLI management tool
+├── schema.sql               # Database schema
+├── docker-compose.yaml      # PostgreSQL container
+├── requirements.txt         # Python dependencies
+├── .env                     # Environment configuration
+└── README.md                # This file
 ```
 
-#### 2️⃣ Install Docker (if not installed)
+## 🚀 Quick Start
+
+### Prerequisites
+
+- Python 3.8 or higher
+- Docker and Docker Compose
+- Telegram Bot Token (from [@BotFather](https://t.me/botfather))
+- Your Telegram User ID (from [@userinfobot](https://t.me/userinfobot))
+
+### Installation
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/yourusername/telegram-subscription-bot.git
+   cd telegram-subscription-bot
+   ```
+
+2. **Install dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Configure environment**
+   
+   Create `.env` file in project root:
+   ```env
+   # Bot Configuration
+   BOT_TOKEN=your_telegram_bot_token_here
+   
+   # Database Configuration
+   DATABASE_URL=postgresql://userdrelegram:yourpassword@localhost:9204/drelegrambotdb
+   DB_MIN_POOL_SIZE=2
+   DB_MAX_POOL_SIZE=10
+   DB_COMMAND_TIMEOUT=60
+   
+   # Admin Configuration (comma-separated Telegram user IDs)
+   ADMIN_USER_IDS=123456789,987654321
+   
+   # Backup Configuration
+   BACKUP_DIR=./backups
+   AUTO_BACKUP_ENABLED=true
+   AUTO_BACKUP_INTERVAL_HOURS=24
+   
+   # Logging Configuration
+   LOG_LEVEL=INFO
+   LOG_DIR=./logs
+   ```
+
+4. **Start PostgreSQL database**
+   ```bash
+   docker-compose up -d
+   ```
+
+5. **Verify database connection**
+   ```bash
+   python utils.py check
+   ```
+
+6. **Run the bot**
+   ```bash
+   cd src
+   python main.py
+   ```
+
+## 💳 Subscription Plans
+
+| Plan | Price | Duration | Features |
+|------|-------|----------|----------|
+| 📦 Standard | $9.99/month | 30 days | Basic features, 5 API calls/day, Email support |
+| ⭐ Pro | $29.99/month | 30 days | All Standard + 100 API calls/day, Priority support, Analytics |
+| 💼 Business+ | $79.99/month | 30 days | All Pro + Unlimited API, 24/7 support, Custom integrations |
+| 🏢 Enterprise+ | Custom | 30 days | All Business+ + Unlimited accounts, SLA, On-premise |
+
+*Plans can be customized in `src/config.py`*
+
+## 🎮 Bot Commands
+
+### User Commands
+- `/start` - Show main menu and welcome message
+- `/account` - View account information
+- `/plans` - Browse available subscription plans
+- `/status` - Check current subscription status
+- `/help` - Display help information
+
+### Admin Commands
+- `/admin` - Open admin control panel
+- `/stats` - View bot statistics
+- `/backup` - Create database backup manually
+
+## 🛠️ CLI Management Tools
+
+Run from project root:
+
 ```bash
-# Update system
-apt update && apt upgrade -y
+# Check database connection
+python utils.py check
 
-# Install Docker
-curl -fsSL https://get.docker.com -o get-docker.sh
-sh get-docker.sh
+# View statistics
+python utils.py stats
 
-# Install Docker Compose
-apt install docker-compose -y
+# List recent users
+python utils.py users 20
 
-# Verify installation
-docker --version
-docker-compose --version
+# Create backup
+python utils.py backup
+
+# List all backups
+python utils.py list-backups
+
+# Restore from backup
+python utils.py restore backups/backup_20260107_120000.json
+
+# Restore and clear existing data
+python utils.py restore backups/backup_20260107_120000.json --clear
+
+# Manually expire old subscriptions
+python utils.py expire
+
+# Show help
+python utils.py help
 ```
 
-#### 3️⃣ Create Project Directory
-```bash
-mkdir -p ~/subscription-bot
-cd ~/subscription-bot
+## 🗄️ Database Schema
+
+### Users Table
+```sql
+user_id BIGINT PRIMARY KEY
+username VARCHAR(255)
+email VARCHAR(255) UNIQUE
+created_at TIMESTAMP
+updated_at TIMESTAMP
 ```
 
-#### 4️⃣ Upload Your Files
-Transfer these files to the server:
-- main.py
-- schema.sql
-- Dockerfile
-- docker-compose.yml
-- requirements.txt
-
-**Option A: Using SCP from your local machine:**
-```bash
-# From your local machine (not on server)
-scp main.py schema.sql Dockerfile docker-compose.yml requirements.txt root@your-server-ip:~/subscription-bot/
+### Subscriptions Table
+```sql
+id SERIAL PRIMARY KEY
+user_id BIGINT (FK to users)
+plan VARCHAR(50) (standard|pro|business+|enterprise+)
+status VARCHAR(20) (active|expired|cancelled)
+start_date TIMESTAMP
+end_date TIMESTAMP
+created_at TIMESTAMP
+updated_at TIMESTAMP
 ```
 
-**Option B: Using Git:**
+## 📊 Features Breakdown
+
+### User Management
+- Create account with email validation
+- View account information
+- Update user details (username, email)
+- Delete user (cascades to subscriptions)
+- List all users with pagination
+
+### Subscription Management
+- Create new subscription (auto-cancels existing active ones)
+- Get active subscription for user
+- View subscription history
+- Update subscription status
+- Cancel subscription
+- Delete subscription
+- Check days remaining
+- Find expiring subscriptions
+
+### Statistics & Analytics
+- Total users count
+- Active subscriptions count
+- Expired subscriptions count
+- Cancelled subscriptions count
+- Subscriptions by plan breakdown
+
+### Backup & Restore
+- Export to JSON format
+- Import from JSON
+- List all backups with metadata
+- Automatic scheduled backups
+- Manual backup creation
+
+## 🔧 Configuration
+
+All configuration is managed through environment variables and `src/config.py`:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `BOT_TOKEN` | Telegram Bot API token | Required |
+| `DATABASE_URL` | PostgreSQL connection string | Required |
+| `ADMIN_USER_IDS` | Comma-separated admin Telegram IDs | Empty |
+| `DB_MIN_POOL_SIZE` | Minimum database connections | 2 |
+| `DB_MAX_POOL_SIZE` | Maximum database connections | 10 |
+| `AUTO_BACKUP_ENABLED` | Enable automatic backups | false |
+| `AUTO_BACKUP_INTERVAL_HOURS` | Backup interval in hours | 24 |
+| `LOG_LEVEL` | Logging level (DEBUG/INFO/WARNING) | INFO |
+
+## 🏗️ Architecture
+
+### Modular Design
+- **config.py** - Centralized configuration with validation
+- **database.py** - Complete database layer with CRUD operations
+- **keyboards.py** - Reusable Telegram keyboard layouts
+- **handlers.py** - Command and callback handlers
+- **main.py** - Application entry point and lifecycle management
+
+### Key Patterns
+- **Dependency Injection** - Database manager injected into handlers
+- **Separation of Concerns** - Each module has single responsibility
+- **Error Handling** - Comprehensive try-catch blocks with logging
+- **Connection Pooling** - Async PostgreSQL connection pool
+- **Background Jobs** - Scheduled tasks for maintenance
+
+## 📝 Development
+
+### Adding New Features
+
+1. **Add database operations** in `src/database.py`
+2. **Add configuration** in `src/config.py`
+3. **Add keyboard layouts** in `src/keyboards.py`
+4. **Add handlers** in `src/handlers.py`
+5. **Register handlers** in `src/main.py`
+
+### Testing
+
 ```bash
-# On server
-git clone your-repo-url
-cd your-repo-name
+# Test database connection
+python utils.py check
+
+# View current stats
+python utils.py stats
+
+# Create test backup
+python utils.py backup
 ```
 
-**Option C: Manual file creation:**
+## 🐛 Troubleshooting
+
+### Database Connection Issues
 ```bash
-# Create each file manually using nano
-nano main.py      # Paste content and save (Ctrl+X, Y, Enter)
-nano schema.sql
-nano Dockerfile
-nano docker-compose.yml
-nano requirements.txt
-```
-
-#### 5️⃣ Configure Environment Variables
-```bash
-# Edit .env file
-nano .env
-```
-
-Add your bot token:
-```bash
-BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
-DB_PASSWORD=your_strong_password_here
-PORT=8080
-```
-
-Save: `Ctrl+X`, then `Y`, then `Enter`
-
-#### 6️⃣ Start the Bot
-```bash
-# Build and start containers
-docker-compose up -d
-
-# Check if containers are running
+# Check if database is running
 docker-compose ps
-
-# View bot logs
-docker-compose logs -f bot
-```
-
-You should see:
-```
-subscription_bot | INFO | Starting Subscription Management Bot...
-subscription_bot | INFO | Database pool created successfully
-subscription_bot | INFO | Bot is running...
-```
-
-#### 7️⃣ Test Your Bot
-1. Open Telegram
-2. Search for your bot username
-3. Send `/start` command
-4. You should see the welcome message with buttons!
-
----
-
-### Method B: Deploy Locally (for testing)
-
-#### 1️⃣ Navigate to Project Directory
-```bash
-cd /path/to/subscription-bot
-```
-
-#### 2️⃣ Edit .env File
-```bash
-# Windows
-notepad .env
-
-# Mac/Linux
-nano .env
-```
-
-Add your bot token:
-```
-BOT_TOKEN=your_token_here
-DB_PASSWORD=postgres123
-```
-
-#### 3️⃣ Start with Docker Compose
-```bash
-docker-compose up -d
-```
-
-#### 4️⃣ Check Logs
-```bash
-docker-compose logs -f bot
-```
-
----
-
-## 🔧 Useful Commands
-
-### Container Management
-```bash
-# Start containers
-docker-compose up -d
-
-# Stop containers
-docker-compose down
-
-# Restart bot only
-docker-compose restart bot
-
-# View all logs
-docker-compose logs -f
-
-# View bot logs only
-docker-compose logs -f bot
 
 # View database logs
-docker-compose logs -f postgres
-
-# Check container status
-docker-compose ps
-
-# Rebuild after code changes
-docker-compose up -d --build
-```
-
-### Database Management
-```bash
-# Access PostgreSQL shell
-docker-compose exec postgres psql -U postgres -d subscription_bot
-
-# Inside PostgreSQL shell:
-# List all tables
-\dt
-
-# View users
-SELECT * FROM users;
-
-# View subscriptions
-SELECT * FROM subscriptions;
-
-# Exit
-\q
-
-# Backup database
-docker-compose exec postgres pg_dump -U postgres subscription_bot > backup_$(date +%Y%m%d).sql
-
-# Restore database
-docker-compose exec -T postgres psql -U postgres subscription_bot < backup_20260106.sql
-```
-
-### Troubleshooting
-```bash
-# Check if containers are running
-docker ps
-
-# View all container logs
-docker-compose logs
-
-# Restart everything
-docker-compose down && docker-compose up -d
-
-# Remove everything and start fresh
-docker-compose down -v
-docker-compose up -d --build
-
-# Check container resource usage
-docker stats
-```
-
----
-
-## 🔐 Security Best Practices
-
-### 1️⃣ Change Default Password
-```bash
-# In .env file, change:
-DB_PASSWORD=use_a_very_strong_password_here_123!@#
-```
-
-### 2️⃣ Firewall Setup (Optional but Recommended)
-```bash
-# Allow SSH
-ufw allow 22
-
-# Enable firewall
-ufw enable
-
-# PostgreSQL port is only accessible inside Docker network
-# No need to expose it externally
-```
-
-### 3️⃣ Keep Bot Token Secret
-- Never commit .env to Git
-- Never share your bot token
-- Regenerate token if exposed (via @BotFather)
-
----
-
-## 📊 Monitoring Your Bot
-
-### Check if Bot is Running
-```bash
-# Method 1: Check container status
-docker-compose ps
-
-# Method 2: Check logs
-docker-compose logs --tail=50 bot
-
-# Method 3: Test in Telegram
-# Send /start to your bot
-```
-
-### View Real-time Logs
-```bash
-# All logs
-docker-compose logs -f
-
-# Only bot logs
-docker-compose logs -f bot
-
-# Last 100 lines
-docker-compose logs --tail=100 bot
-```
-
----
-
-## 🔄 Updating Your Bot
-
-### Update Code
-```bash
-# 1. Edit main.py on your local machine
-nano main.py
-
-# 2. Rebuild and restart
-docker-compose up -d --build
-
-# 3. Check logs
-docker-compose logs -f bot
-```
-
-### Update Database Schema
-```bash
-# 1. Edit schema.sql
-nano schema.sql
-
-# 2. Apply changes manually
-docker-compose exec postgres psql -U postgres -d subscription_bot -f /docker-entrypoint-initdb.d/01-schema.sql
-```
-
----
-
-## 🛑 Stopping the Bot
-
-### Temporary Stop
-```bash
-docker-compose stop
-```
-
-### Permanent Stop and Remove
-```bash
-# Stop and remove containers (keeps data)
-docker-compose down
-
-# Remove everything including data
-docker-compose down -v
-```
-
----
-
-## 📱 Testing Your Bot
-
-1. **Open Telegram**
-2. **Search for your bot** by username
-3. **Send `/start`** - You should see the welcome menu
-4. **Test features:**
-   - Click "Create Account" → Enter email
-   - Click "Choose Plan" → Select a plan
-   - Click "Subscription Status" → See days left
-   - Click "Plan Details" → View plan information
-
----
-
-## 🐛 Common Issues & Solutions
-
-### Issue: "Bot not responding"
-**Solution:**
-```bash
-# Check if container is running
-docker-compose ps
-
-# Check logs for errors
-docker-compose logs bot
-
-# Restart bot
-docker-compose restart bot
-```
-
-### Issue: "Database connection failed"
-**Solution:**
-```bash
-# Check if postgres is running
-docker-compose ps postgres
-
-# Check postgres logs
 docker-compose logs postgres
 
-# Restart postgres
+# Restart database
 docker-compose restart postgres
 ```
 
-### Issue: "Invalid bot token"
-**Solution:**
+### Bot Not Starting
 ```bash
-# 1. Verify token in .env file
-cat .env
+# Check configuration
+python utils.py check
 
-# 2. Get new token from @BotFather if needed
-# 3. Update .env and restart
-nano .env
-docker-compose restart bot
+# View bot logs
+tail -f logs/bot.log
+
+# Verify bot token
+curl https://api.telegram.org/bot<YOUR_TOKEN>/getMe
 ```
 
-### Issue: "Port already in use"
-**Solution:**
+### Import Errors
 ```bash
-# Find what's using port 5432
-sudo lsof -i :5432
+# Ensure you're in the correct directory
+cd src
+python main.py
 
-# Kill the process or change port in docker-compose.yml
+# Or use module syntax
+python -m src.main
 ```
 
----
+## 📈 Production Deployment
 
-## 💡 Production Tips
+### Security Checklist
+- [ ] Use strong database passwords
+- [ ] Store sensitive data in environment variables
+- [ ] Enable SSL/TLS for database connections
+- [ ] Set up admin user IDs
+- [ ] Enable automatic backups
+- [ ] Configure log rotation
 
-### 1️⃣ Use Environment Variables
-Never hardcode secrets in code. Always use .env file.
+### Monitoring
+- Set up log aggregation (ELK, Papertrail)
+- Monitor database performance
+- Set up alerts for errors
+- Regular backup verification
 
-### 2️⃣ Enable Logging
-Logs are already configured in docker-compose.yml with rotation.
+### Scaling
+- Increase database pool size if needed
+- Deploy multiple bot instances
+- Use Redis for caching (optional)
+- Implement rate limiting
 
-### 3️⃣ Regular Backups
-```bash
-# Add to crontab for daily backups
-0 2 * * * cd /root/subscription-bot && docker-compose exec postgres pg_dump -U postgres subscription_bot > /backups/db_$(date +\%Y\%m\%d).sql
-```
+## 🤝 Contributing
 
-### 4️⃣ Monitor Resources
-```bash
-# Check memory/CPU usage
-docker stats
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-# Set resource limits in docker-compose.yml if needed
-```
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
 
-### 5️⃣ Use Restart Policy
-Already configured with `restart: always` in docker-compose.yml
+## 📄 License
 
----
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🎉 Success Checklist
+## 🙏 Acknowledgments
 
-- [ ] Docker and Docker Compose installed
-- [ ] Bot token obtained from @BotFather
-- [ ] All files uploaded to server
-- [ ] .env file configured with bot token
-- [ ] Containers started with `docker-compose up -d`
-- [ ] Bot responding to `/start` command in Telegram
-- [ ] Database storing users and subscriptions
-- [ ] Logs showing no errors
-
----
+- [python-telegram-bot](https://python-telegram-bot.org/) - Telegram Bot API wrapper
+- [asyncpg](https://github.com/MagicStack/asyncpg) - Fast PostgreSQL client
+- [python-dotenv](https://github.com/theskumar/python-dotenv) - Environment management
 
 ## 📞 Support
 
-If you encounter issues:
-1. Check logs: `docker-compose logs -f bot`
-2. Verify containers: `docker-compose ps`
-3. Test database: `docker-compose exec postgres psql -U postgres -d subscription_bot`
+For questions and support:
+- 📧 Email: support@example.com
+- 🐛 Issues: [GitHub Issues](https://github.com/yourusername/telegram-subscription-bot/issues)
+- 💬 Telegram: [@yourusername](https://t.me/yourusername)
 
 ---
 
-**Your bot should now be running! 🚀**
-
-Test it by sending `/start` to your bot on Telegram.
+**Built with ❤️ using Python, PostgreSQL, and python-telegram-bot**
