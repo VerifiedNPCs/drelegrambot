@@ -210,3 +210,14 @@ __marimo__/
 
 # Database
 schema.sql
+
+# backup files
+*.bak
+backups/
+
+# Logs
+logs/
+*.log
+*.out
+*.err
+debug.log
