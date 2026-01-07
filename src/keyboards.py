@@ -3,7 +3,7 @@ from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from config import Config
 
 
-def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+def get_main_menu_keyboard(user_id: int = None) -> InlineKeyboardMarkup:
     """Main menu with glass button style"""
     keyboard = [
         [
@@ -19,6 +19,11 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("ℹ️ Help", callback_data="help"),
         ]
     ]
+    
+    # Add admin button only for admins
+    if user_id and Config.is_admin(user_id):
+        keyboard.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel")])
+    
     return InlineKeyboardMarkup(keyboard)
 
 

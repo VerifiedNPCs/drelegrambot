@@ -2,7 +2,7 @@ import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -131,6 +131,25 @@ async def post_init(application: Application):
         logger.error("✗ Failed to initialize database")
         raise RuntimeError("Failed to initialize database")
     logger.info("✓ Database initialized successfully")
+    
+    commands = [
+        BotCommand("start", "🏠 Start the bot and show main menu"),
+        BotCommand("account", "👤 View your account information"),
+        BotCommand("plans", "💳 Browse subscription plans"),
+        BotCommand("status", "📊 Check subscription status"),
+        BotCommand("help", "❓ Get help and support"),
+    ]
+    
+    # Add admin commands if configured
+    if Config.ADMIN_USER_IDS:
+        commands.extend([
+            BotCommand("admin", "🔐 Admin panel (admin only)"),
+            BotCommand("stats", "📊 Bot statistics (admin only)"),
+            BotCommand("backup", "💾 Create backup (admin only)"),
+        ])
+    
+    await application.bot.set_my_commands(commands)
+    logger.info("✓ Bot commands menu configured")
 
     # Inject database manager into handlers
     set_db_manager(db_manager)
