@@ -1,6 +1,10 @@
 """Bot command and callback handlers"""
 import logging
-from telegram import Update
+import time
+from payment import CryptoPaymentGateway
+from token_manager import TokenManager
+from payment_manager import PaymentManager
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from telegram.ext import ContextTypes
 
 from config import Config
@@ -10,12 +14,14 @@ logger = logging.getLogger(__name__)
 
 # Database manager will be injected
 db_manager = None
+payment_manager = None
 
 
 def set_db_manager(manager):
-    """Set the database manager instance"""
-    global db_manager
+    """Set the database manager instance and init payment manager"""
+    global db_manager, payment_manager
     db_manager = manager
+    payment_manager = PaymentManager(manager)
 
 
 # ==========================================
@@ -271,7 +277,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 # Callback Query Handler
 # ==========================================
-
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all callback queries"""
     query = update.callback_query
@@ -287,23 +292,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # Main menu
+    # --- Main Navigation ---
     if data == "main_menu":
         text = f"👋 Welcome back {user.first_name}!\n\nSelect an option below:"
         await query.edit_message_text(
             text,
-            reply_markup=get_main_menu_keyboard(),
+            reply_markup=get_main_menu_keyboard(user_id),
             parse_mode="HTML"
         )
 
-    # Create account
+    # --- Account Management ---
     elif data == "create_account":
         db_user = await db_manager.get_user(user_id)
         if db_user:
             text = "✅ You already have an account!\n\n" + await format_user_status(user_id)
             await query.edit_message_text(
                 text,
-                reply_markup=get_main_menu_keyboard(),
+                reply_markup=get_main_menu_keyboard(user_id),
                 parse_mode="HTML"
             )
         else:
@@ -319,30 +324,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
 
-    # My account
     elif data == "my_account":
         db_user = await db_manager.get_user(user_id)
         if not db_user:
-            text = (
-                "❌ You don't have an account yet.\n\n"
-                "Click 'Create Account' to get started!"
-            )
+            text = "❌ You don't have an account yet.\n\nClick 'Create Account' to get started!"
         else:
             text = await format_user_status(user_id)
 
         await query.edit_message_text(
             text,
-            reply_markup=get_main_menu_keyboard(),
+            reply_markup=get_main_menu_keyboard(user_id),
             parse_mode="HTML"
         )
 
-    # Choose plan
+    # --- Plan Selection & Payment Flow ---
     elif data == "choose_plan":
         db_user = await db_manager.get_user(user_id)
         if not db_user:
-            text = "❌ Please create an account first!"
             await query.edit_message_text(
-                text,
+                "❌ Please create an account first!",
                 reply_markup=get_main_menu_keyboard(),
                 parse_mode="HTML"
             )
@@ -354,8 +354,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
 
-
-    # Plan details menu
     elif data == "plan_details":
         text = "📋 <b>Subscription Plans Overview</b>\n\nSelect a plan to see detailed information:"
         await query.edit_message_text(
@@ -364,8 +362,128 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
         
+    elif data.startswith("detail_"):
+        plan_key = data.replace("detail_", "")
+        plan_info = Config.get_plan(plan_key)
 
-    # Subscription status
+        text = f"{plan_info['emoji']} <b>{plan_info['name']}</b>\n\n"
+        text += f"💰 Price: {plan_info['price']}\n"
+        text += f"⏰ Duration: {plan_info['duration_days']} days\n\n"
+        text += "<b>Features:</b>\n"
+        for feature in plan_info['features']:
+            text += f"• {feature}\n"
+
+        await query.edit_message_text(
+            text,
+            reply_markup=get_plan_action_keyboard(plan_key),
+            parse_mode="HTML"
+        )
+
+    # --- Core Payment Logic (Consolidated) ---
+    elif data.startswith("plan_"):
+        plan_key = data.replace("plan_", "")
+        
+        # 1. Check Account
+        db_user = await db_manager.get_user(user_id)
+        if not db_user:
+            await query.edit_message_text(
+                "❌ Please create an account first!",
+                reply_markup=get_main_menu_keyboard(),
+                parse_mode="HTML"
+            )
+            return
+
+        plan_info = Config.get_plan(plan_key)
+        
+        # 2. Calculate Cost & Credit
+        calculation = await payment_manager.calculate_proration(user_id, plan_key)
+        
+        cost = calculation['cost_to_pay']
+        credit = calculation['credit_applied']
+        message = calculation['message']
+        
+        # 3. Create Payment Request in DB
+        payment_record = await db_manager.create_payment_request(
+            user_id=user_id,
+            plan=plan_key,
+            amount=cost,
+            currency="USD",
+            gateway_name="manual_browser" # Updated gateway name
+        )
+        
+        if not payment_record:
+            await query.edit_message_text("❌ Error processing request. Try again.")
+            return
+
+        payment_id = payment_record['payment_id']
+        
+        # 4. Generate Standard Browser Link
+        # This will open in Chrome/Safari instead of Telegram WebApp
+        payment_url = f"{Config.PAYMENT_URL}?payment_id={payment_id}"
+        
+        # Message construction
+        msg_text = f"💳 <b>{message}</b>\n\n"
+        msg_text += f"Plan: {plan_info['emoji']} {plan_info['name']}\n"
+        
+        if credit > 0:
+            msg_text += f"Unused Credit: -${credit:.2f}\n"
+        
+        msg_text += f"<b>Total Due: ${cost:.2f}</b>\n\n"
+        
+        if cost <= 0:
+            msg_text += "✨ Your credit covers this change!\nClick below to confirm."
+            btn_text = "✅ Confirm Switch"
+        else:
+            msg_text += "Click below to proceed to payment:"
+            btn_text = "💎 Pay via Browser"
+
+        # UPDATED: Use 'url' instead of 'web_app'
+        keyboard = [
+            [InlineKeyboardButton(btn_text, url=payment_url)], 
+            [InlineKeyboardButton("« Cancel", callback_data="choose_plan")]
+        ]
+        
+        await query.edit_message_text(
+            msg_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+
+    # --- Dashboard Access ---
+    elif data == "open_dashboard":
+        db_user = await db_manager.get_user(user_id)
+        if not db_user:
+            text = "❌ <b>Account Required</b>\n\nPlease create an account first."
+            await query.edit_message_text(text, reply_markup=get_main_menu_keyboard(), parse_mode="HTML")
+        else:
+            # 1. Generate Raw Token
+            dashboard_token = TokenManager.generate_secure_token(user_id, db_user['username'], "dashboard")
+            
+            # 2. Hash it for storage
+            dashboard_token_hash = TokenManager.hash_token(dashboard_token)
+            
+            # 3. Store HASH in DB
+            await db_manager.create_user_token(
+                user_id, dashboard_token_hash, "dashboard", expires_hours=24
+            )
+            
+            # 4. Construct URL with RAW Token
+            dashboard_url = f"{Config.DASHBOARD_URL}?user_id={user_id}&token={dashboard_token}"
+            
+            text = (
+                "🌐 <b>Dashboard Access</b>\n\n"
+                "Click below to open your personal dashboard.\n"
+                "Link is valid for 24 hours."
+            )
+            
+            # 5. Pass URL to keyboard
+            await query.edit_message_text(
+                text,
+                reply_markup=get_dashboard_keyboard(dashboard_url), # PASS URL HERE
+                parse_mode="HTML"
+            )
+
+    # --- Subscription Status ---
     elif data == "subscription_status":
         subscription = await db_manager.get_active_subscription(user_id)
 
@@ -379,28 +497,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"Plan: {plan_info['emoji']} {plan_info['name']}\n"
             text += f"Price: {plan_info['price']}\n\n"
 
-            if days_left and days_left > 0:
-                text += f"⏰ Days Remaining: <b>{days_left} days</b>\n\n"
+            if days_left is not None and days_left > 0:
+                text += f"⏰ Days Remaining: <b>{days_left} days</b>\n"
                 if days_left <= 7:
-                    text += "⚠️ Your subscription is expiring soon!"
+                    text += "\n⚠️ Your subscription is expiring soon!"
             else:
-                text += "❌ Status: <b>Expired</b>\n\n"
-                text += "Please renew your subscription."
+                text += "❌ Status: <b>Expired</b>\nPlease renew your subscription."
 
         await query.edit_message_text(
             text,
-            reply_markup=get_main_menu_keyboard(),
+            reply_markup=get_main_menu_keyboard(user_id),
             parse_mode="HTML"
         )
 
-    # Help
+    # --- Help ---
     elif data == "help":
         help_text = (
             "📚 <b>Help & Support</b>\n\n"
-            "<b>How to use this bot:</b>\n\n"
+            "<b>How to use this bot:</b>\n"
             "1️⃣ Create an account\n"
             "2️⃣ Choose a subscription plan\n"
-            "3️⃣ Monitor your subscription status\n\n"
+            "3️⃣ Pay securely via Dashboard\n\n"
             "<b>Need assistance?</b>\n"
             "Contact: @drele_gram"
         )
@@ -409,99 +526,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_back_keyboard(),
             parse_mode="HTML"
         )
-        
-    # Admin panel
+
+    # --- Admin Section ---
     elif data == "admin_panel":
         if not Config.is_admin(user_id):
             await query.answer("❌ Admin only", show_alert=True)
             return
         
-        text = (
-            "🔐 <b>Admin Panel</b>\n\n"
-            "Welcome to the admin control panel. "
-            "Use the buttons below to manage the bot."
-        )
-        
+        text = "🔐 <b>Admin Panel</b>\n\nSelect an option:"
         await query.edit_message_text(
             text,
             reply_markup=get_admin_keyboard(),
             parse_mode="HTML"
         )
 
-    # Individual plan details
-    elif data.startswith("detail_"):
-        plan_key = data.replace("detail_", "")
-        plan_info = Config.get_plan(plan_key)
-
-        text = f"{plan_info['emoji']} <b>{plan_info['name']}</b>\n\n"
-        text += f"💰 Price: {plan_info['price']}\n"
-        text += f"⏰ Duration: {plan_info['duration_days']} days\n\n"
-        text += "<b>Features:</b>\n"
-        for feature in plan_info['features']:
-            text += f"{feature}\n"
-
-        await query.edit_message_text(
-            text,
-            reply_markup=get_plan_action_keyboard(plan_key),
-            parse_mode="HTML"
-        )
-        
-    # Plan selection
-    elif data.startswith("plan_"):
-        plan_key = data.replace("plan_", "")
-        db_user = await db_manager.get_user(user_id)
-
-        if not db_user:
-            text = "❌ Please create an account first!"
-            await query.edit_message_text(
-                text,
-                reply_markup=get_main_menu_keyboard(),
-                parse_mode="HTML"
-            )
-        else:
-            plan_info = Config.get_plan(plan_key)
-            if not plan_info:
-                logger.error(f"Invalid plan key: {plan_key}")
-                text = "❌ Invalid plan selected. Please try again."
-                await query.edit_message_text(
-                    text,
-                    reply_markup=get_plans_keyboard(),
-                    parse_mode="HTML"
-                )
-                return
-            duration = plan_info['duration_days']
-
-            subscription = await db_manager.create_subscription(user_id, plan_key, duration)
-
-            if subscription:
-                text = (
-                    f"✅ <b>Subscription Activated!</b>\n\n"
-                    f"Plan: {plan_info['emoji']} {plan_info['name']}\n"
-                    f"Price: {plan_info['price']}\n"
-                    f"Duration: {duration} days\n\n"
-                    f"Thank you for subscribing! 🎉"
-                )
-            else:
-                text = "❌ Failed to activate subscription. Please try again."
-
-            await query.edit_message_text(
-                text,
-                reply_markup=get_main_menu_keyboard(),
-                parse_mode="HTML"
-            )
-
-    # Admin callbacks
     elif data == "admin_stats":
-        if not Config.is_admin(user_id):
-            await query.answer("❌ Admin only", show_alert=True)
-            return
-
+        if not Config.is_admin(user_id): return
         stats = await db_manager.get_statistics()
         text = "📊 <b>Bot Statistics</b>\n\n"
         text += f"👥 Total Users: {stats.get('total_users', 0)}\n"
-        text += f"✅ Active: {stats.get('active_subscriptions', 0)}\n"
-        text += f"❌ Expired: {stats.get('expired_subscriptions', 0)}\n"
-
+        text += f"✅ Active Subs: {stats.get('active_subscriptions', 0)}\n"
+        text += f"❌ Expired Subs: {stats.get('expired_subscriptions', 0)}\n"
         await query.edit_message_text(
             text,
             reply_markup=get_admin_keyboard(),
@@ -509,24 +554,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "admin_backup":
-        if not Config.is_admin(user_id):
-            await query.answer("❌ Admin only", show_alert=True)
-            return
-
+        if not Config.is_admin(user_id): return
         await query.answer("Creating backup...", show_alert=False)
         backup_path = await db_manager.backup_to_json()
-
         if backup_path:
             text = f"✅ Backup created!\n\n<code>{backup_path}</code>"
         else:
             text = "❌ Backup failed"
-
         await query.edit_message_text(
             text,
             reply_markup=get_admin_keyboard(),
             parse_mode="HTML"
         )
-
 
 # ==========================================
 # Message Handlers

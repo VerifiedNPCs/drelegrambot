@@ -113,6 +113,27 @@ class Config:
             "emoji": "🏢"
         }
     }
+    
+    # ==========================================
+    # Payment URL
+    # ==========================================
+    TOKEN_SECRET_SALT = os.getenv("TOKEN_SECRET_SALT", "change-this-in-production")
+    TOKEN_EXPIRY_HOURS = int(os.getenv("TOKEN_EXPIRY_HOURS", "24"))
+    PAYMENT_TOKEN_EXPIRY_MINUTES = int(os.getenv("PAYMENT_TOKEN_EXPIRY_MINUTES", "15"))
+
+    # ==========================================
+    # Dashboard URL
+    # ==========================================
+    DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:5173/dashboard")
+    PAYMENT_URL = os.getenv("PAYMENT_URL", "http://localhost:5173/payment")
+    FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+    
+    # ==========================================
+    # API Configuration
+    # ==========================================
+    API_HOST = os.getenv("API_HOST", "localhost")
+    API_PORT = int(os.getenv("API_PORT", "3141"))
+
 
     @classmethod
     def validate(cls) -> bool:

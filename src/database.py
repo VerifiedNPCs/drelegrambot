@@ -96,54 +96,101 @@ class DatabaseManager:
     async def _create_basic_schema(self):
         """Create basic schema if schema.sql doesn't exist"""
         schema = """
--- Users table
-CREATE TABLE IF NOT EXISTS users (
-    user_id BIGINT PRIMARY KEY,
-    username VARCHAR(255) NOT NULL,
-    email VARCHAR(255) NOT NULL UNIQUE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+            -- Users table
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username VARCHAR(255) NOT NULL,
+                email VARCHAR(255) NOT NULL UNIQUE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
 
--- Subscriptions table
-CREATE TABLE IF NOT EXISTS subscriptions (
-    id SERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    plan VARCHAR(50) NOT NULL CHECK (plan IN ('standard', 'pro', 'business+', 'enterprise+')),
-    status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'expired', 'cancelled')),
-    start_date TIMESTAMP WITH TIME ZONE NOT NULL,
-    end_date TIMESTAMP WITH TIME ZONE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+            -- Subscriptions table
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                plan VARCHAR(50) NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'active',
+                start_date TIMESTAMP WITH TIME ZONE NOT NULL,
+                end_date TIMESTAMP WITH TIME ZONE NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
 
--- Create indexes
-CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
-CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status);
-CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+            -- User Tokens (for Dashboard Auth)
+            CREATE TABLE IF NOT EXISTS user_tokens (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                token_hash VARCHAR(255) NOT NULL,
+                token_type VARCHAR(50) DEFAULT 'dashboard',
+                is_active BOOLEAN DEFAULT TRUE,
+                last_used_at TIMESTAMP WITH TIME ZONE,
+                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
 
--- Function to update updated_at timestamp
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = CURRENT_TIMESTAMP;
-    RETURN NEW;
-END;
-$$ language 'plpgsql';
+            -- Payment Requests
+            CREATE TABLE IF NOT EXISTS payment_requests (
+                id SERIAL PRIMARY KEY,
+                payment_id VARCHAR(100) NOT NULL UNIQUE,
+                user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                plan VARCHAR(50) NOT NULL,
+                amount DECIMAL(10, 2) NOT NULL,
+                currency VARCHAR(10) DEFAULT 'USD',
+                crypto_currency VARCHAR(10),
+                status VARCHAR(20) DEFAULT 'pending', 
+                gateway_name VARCHAR(50),
+                gateway_order_id VARCHAR(100),
+                payment_url TEXT,
+                metadata JSONB,
+                completed_at TIMESTAMP WITH TIME ZONE,
+                expires_at TIMESTAMP WITH TIME ZONE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
 
--- Triggers for auto-updating updated_at
-DROP TRIGGER IF EXISTS update_users_updated_at ON users;
-CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+            -- Transactions (History)
+            CREATE TABLE IF NOT EXISTS transactions (
+                transaction_id VARCHAR(100) PRIMARY KEY,
+                payment_request_id INT REFERENCES payment_requests(id),
+                user_id BIGINT NOT NULL REFERENCES users(user_id),
+                amount DECIMAL(10, 2) NOT NULL,
+                currency VARCHAR(10) DEFAULT 'USD',
+                crypto_amount DECIMAL(18, 8),
+                crypto_currency VARCHAR(10),
+                gateway_transaction_id VARCHAR(100),
+                gateway_name VARCHAR(50),
+                tx_hash VARCHAR(255),
+                status VARCHAR(20) DEFAULT 'confirmed',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
 
-DROP TRIGGER IF EXISTS update_subscriptions_updated_at ON subscriptions;
-CREATE TRIGGER update_subscriptions_updated_at BEFORE UPDATE ON subscriptions
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+            -- User Wallets
+            CREATE TABLE IF NOT EXISTS user_wallets (
+                user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+                wallet_address VARCHAR(255),
+                wallet_type VARCHAR(50) DEFAULT 'usdt',
+                is_active BOOLEAN DEFAULT TRUE,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            -- Functions needed for IDs
+            CREATE OR REPLACE FUNCTION generate_payment_id() RETURNS text AS $$
+            BEGIN
+                RETURN 'PAY-' || floor(extract(epoch from clock_timestamp()) * 1000)::text;
+            END;
+            $$ LANGUAGE plpgsql;
+
+            CREATE OR REPLACE FUNCTION generate_transaction_id() RETURNS text AS $$
+            BEGIN
+                RETURN 'TX-' || floor(extract(epoch from clock_timestamp()) * 1000)::text;
+            END;
+            $$ LANGUAGE plpgsql;
         """
 
         async with self.pool.acquire() as conn:
             await conn.execute(schema)
-        logger.info("Basic schema created successfully")
+        logger.info("Basic schema created successfully (Users, Subs, Payments, Tokens)")
+
 
     # ==========================================
     # User CRUD Operations
@@ -643,3 +690,279 @@ CREATE TRIGGER update_subscriptions_updated_at BEFORE UPDATE ON subscriptions
         except Exception as e:
             logger.exception(f"Error listing backups: {e}")
             return []
+        
+    # ==========================================
+    # TOKEN MANAGEMENT
+    # ==========================================
+    
+    async def create_user_token(
+        self, 
+        user_id: int, 
+        token_hash: str, 
+        token_type: str = "dashboard",
+        expires_hours: int = 24
+    ) -> Optional[Dict]:
+        """Create a new access token"""
+        try:
+            expires_at = datetime.now() + timedelta(hours=expires_hours)
+            
+            query = """
+                INSERT INTO user_tokens (user_id, token_hash, token_type, expires_at)
+                VALUES ($1, $2, $3, $4)
+                RETURNING id, token_hash, expires_at, created_at
+            """
+            
+            row = await self.pool.fetchrow(query, user_id, token_hash, token_type, expires_at)
+            return dict(row) if row else None
+            
+        except Exception as e:
+            logger.exception(f"Failed to create token: {e}")
+            return None
+    
+    async def verify_user_token(self, token_hash: str) -> Optional[Dict]:
+        """Verify token and return user data if valid"""
+        try:
+            query = """
+                SELECT ut.*, u.username, u.email
+                FROM user_tokens ut
+                JOIN users u ON ut.user_id = u.user_id
+                WHERE ut.token_hash = $1 
+                  AND ut.is_active = TRUE 
+                  AND ut.expires_at > CURRENT_TIMESTAMP
+            """
+            
+            row = await self.pool.fetchrow(query, token_hash)
+            
+            if row:
+                # Update last_used_at
+                await self.pool.execute(
+                    "UPDATE user_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE token_hash = $1",
+                    token_hash
+                )
+                return dict(row)
+            
+            return None
+            
+        except Exception as e:
+            logger.exception(f"Token verification failed: {e}")
+            return None
+    
+    # ==========================================
+    # PAYMENT MANAGEMENT
+    # ==========================================
+    
+    async def create_payment_request(
+        self,
+        user_id: int,
+        plan: str,
+        amount: float,
+        currency: str = "USD",
+        crypto_currency: Optional[str] = None,
+        gateway_name: Optional[str] = None,
+        expires_minutes: int = 30
+    ) -> Optional[Dict]:
+        """Create a new payment request"""
+        try:
+            payment_id = await self.pool.fetchval("SELECT generate_payment_id()")
+            expires_at = datetime.now() + timedelta(minutes=expires_minutes)
+            
+            query = """
+                INSERT INTO payment_requests 
+                (payment_id, user_id, plan, amount, currency, crypto_currency, gateway_name, expires_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING id, payment_id, user_id, plan, amount, status, created_at, expires_at
+            """
+            
+            row = await self.pool.fetchrow(
+                query, payment_id, user_id, plan, amount, currency, 
+                crypto_currency, gateway_name, expires_at
+            )
+            
+            return dict(row) if row else None
+            
+        except Exception as e:
+            logger.exception(f"Failed to create payment request: {e}")
+            return None
+    
+    async def update_payment_request(
+        self,
+        payment_id: str,
+        status: str,
+        gateway_order_id: Optional[str] = None,
+        payment_url: Optional[str] = None,
+        metadata: Optional[Dict] = None
+    ) -> bool:
+        """Update payment request status"""
+        try:
+            query = """
+                UPDATE payment_requests
+                SET status = $2,
+                    gateway_order_id = COALESCE($3, gateway_order_id),
+                    payment_url = COALESCE($4, payment_url),
+                    metadata = COALESCE($5::jsonb, metadata),
+                    completed_at = CASE WHEN $2 = 'completed' THEN CURRENT_TIMESTAMP ELSE completed_at END
+                WHERE payment_id = $1
+            """
+            
+            await self.pool.execute(query, payment_id, status, gateway_order_id, payment_url, metadata)
+            return True
+            
+        except Exception as e:
+            logger.exception(f"Failed to update payment request: {e}")
+            return False
+    
+    async def get_payment_request(self, payment_id: str) -> Optional[Dict]:
+        """Get payment request by ID"""
+        try:
+            query = "SELECT * FROM payment_requests WHERE payment_id = $1"
+            row = await self.pool.fetchrow(query, payment_id)
+            return dict(row) if row else None
+        except Exception as e:
+            logger.exception(f"Failed to get payment request: {e}")
+            return None
+    
+    async def create_transaction(
+        self,
+        user_id: int,
+        payment_request_id: int,
+        amount: float,
+        currency: str = "USD",
+        crypto_amount: Optional[float] = None,
+        crypto_currency: Optional[str] = None,
+        gateway_transaction_id: Optional[str] = None,
+        gateway_name: Optional[str] = None,
+        tx_hash: Optional[str] = None
+    ) -> Optional[Dict]:
+        """Create a transaction record"""
+        try:
+            transaction_id = await self.pool.fetchval("SELECT generate_transaction_id()")
+            
+            query = """
+                INSERT INTO transactions 
+                (transaction_id, payment_request_id, user_id, amount, currency, 
+                 crypto_amount, crypto_currency, gateway_transaction_id, gateway_name, tx_hash, status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'confirmed')
+                RETURNING *
+            """
+            
+            row = await self.pool.fetchrow(
+                query, transaction_id, payment_request_id, user_id, amount, currency,
+                crypto_amount, crypto_currency, gateway_transaction_id, gateway_name, tx_hash
+            )
+            
+            return dict(row) if row else None
+            
+        except Exception as e:
+            logger.exception(f"Failed to create transaction: {e}")
+            return None
+    
+    async def get_user_transactions(self, user_id: int, limit: int = 50) -> list:
+        """Get user transaction history"""
+        try:
+            query = """
+                SELECT * FROM user_payment_history 
+                WHERE user_id = $1 
+                ORDER BY payment_date DESC 
+                LIMIT $2
+            """
+            rows = await self.pool.fetch(query, user_id, limit)
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.exception(f"Failed to get transactions: {e}")
+            return []
+    
+    # ==========================================
+    # WALLET MANAGEMENT
+    # ==========================================
+    
+    async def create_user_wallet(
+        self,
+        user_id: int,
+        wallet_address: str,
+        wallet_type: str = "usdt"
+    ) -> Optional[Dict]:
+        """Create user wallet"""
+        try:
+            query = """
+                INSERT INTO user_wallets (user_id, wallet_address, wallet_type)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id) DO UPDATE 
+                SET wallet_address = $2, wallet_type = $3
+                RETURNING *
+            """
+            row = await self.pool.fetchrow(query, user_id, wallet_address, wallet_type)
+            return dict(row) if row else None
+        except Exception as e:
+            logger.exception(f"Failed to create wallet: {e}")
+            return None
+    
+    async def get_user_wallet(self, user_id: int) -> Optional[Dict]:
+        """Get user wallet"""
+        try:
+            query = "SELECT * FROM user_wallets WHERE user_id = $1 AND is_active = TRUE"
+            row = await self.pool.fetchrow(query, user_id)
+            return dict(row) if row else None
+        except Exception as e:
+            logger.exception(f"Failed to get wallet: {e}")
+            return None
+    
+    # ==========================================
+    # NOTIFICATIONS
+    # ==========================================
+    
+    async def create_notification(
+        self,
+        user_id: int,
+        notification_type: str,
+        title: str,
+        message: str,
+        priority: str = "normal"
+    ) -> Optional[Dict]:
+        """Create a notification"""
+        try:
+            query = """
+                INSERT INTO notifications (user_id, notification_type, title, message, priority)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *
+            """
+            row = await self.pool.fetchrow(query, user_id, notification_type, title, message, priority)
+            return dict(row) if row else None
+        except Exception as e:
+            logger.exception(f"Failed to create notification: {e}")
+            return None
+    
+    async def get_user_notifications(self, user_id: int, unread_only: bool = False) -> list:
+        """Get user notifications"""
+        try:
+            if unread_only:
+                query = """
+                    SELECT * FROM notifications 
+                    WHERE user_id = $1 AND is_read = FALSE 
+                    ORDER BY created_at DESC 
+                    LIMIT 50
+                """
+            else:
+                query = """
+                    SELECT * FROM notifications 
+                    WHERE user_id = $1 
+                    ORDER BY created_at DESC 
+                    LIMIT 100
+                """
+            
+            rows = await self.pool.fetch(query, user_id)
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.exception(f"Failed to get notifications: {e}")
+            return []
+    
+    async def mark_notification_read(self, notification_id: int) -> bool:
+        """Mark notification as read"""
+        try:
+            await self.pool.execute(
+                "UPDATE notifications SET is_read = TRUE, read_at = CURRENT_TIMESTAMP WHERE id = $1",
+                notification_id
+            )
+            return True
+        except Exception as e:
+            logger.exception(f"Failed to mark notification read: {e}")
+            return False

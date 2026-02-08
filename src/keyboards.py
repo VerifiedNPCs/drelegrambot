@@ -1,6 +1,37 @@
 """Telegram keyboard layouts"""
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from config import Config
+from token_manager import TokenManager
+
+# Update get_dashboard_keyboard function:
+def get_dashboard_keyboard(dashboard_url: str) -> InlineKeyboardMarkup:
+    """
+    Dashboard button.
+    NOTE: Takes the FULL URL now, doesn't generate its own token.
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🌐 Open Dashboard", 
+                url=dashboard_url
+            )
+        ],
+        [InlineKeyboardButton("« Back to Menu", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_payment_plans_keyboard() -> InlineKeyboardMarkup:
+    """Payment selection for subscription plans"""
+    keyboard = []
+    for plan_key, plan_info in Config.SUBSCRIPTION_PLANS.items():
+        keyboard.append([
+            InlineKeyboardButton(
+                f"💳 Pay for {plan_info['name']} - {plan_info['price']}",
+                callback_data=f"pay_{plan_key}"
+            )
+        ])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data="my_account")])
+    return InlineKeyboardMarkup(keyboard)
 
 
 def get_main_menu_keyboard(user_id: int = None) -> InlineKeyboardMarkup:
@@ -15,7 +46,10 @@ def get_main_menu_keyboard(user_id: int = None) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 Plan Details", callback_data="plan_details"),
         ],
         [
+            InlineKeyboardButton("🌐 Dashboard & Pay", callback_data="open_dashboard"),
             InlineKeyboardButton("⏰ Subscription Status", callback_data="subscription_status"),
+        ],
+        [
             InlineKeyboardButton("ℹ️ Help", callback_data="help"),
         ]
     ]
