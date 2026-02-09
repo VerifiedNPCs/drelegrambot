@@ -1,20 +1,22 @@
 # 🤖 Telegram Subscription Management Bot
 
-A professional, modular Telegram bot for managing subscription plans with PostgreSQL backend, admin panel, and comprehensive CRUD operations.
+A professional, modular Telegram bot for managing subscription plans with a PostgreSQL backend, FastAPI dashboard integration, and robust subscription logic.
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Telegram Bot API](https://img.shields.io/badge/Telegram%20Bot%20API-20.7-blue.svg)](https://python-telegram-bot.org/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-13+-316192.svg)](https://www.postgresql.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-009688.svg)](https://fastapi.tiangolo.com/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16+-316192.svg)](https://www.postgresql.org/)
+[![uv](https://img.shields.io/badge/uv-fast-purple)](https://github.com/astral-sh/uv)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## ✨ Features
 
 ### Core Functionality
 - 👤 **User Management** - Account creation with email validation
-- 💳 **Subscription Plans** - Multiple tiers (Standard, Pro, Business+, Enterprise+)
-- ⏰ **Status Tracking** - Real-time subscription status and days remaining
+- 💳 **Smart Subscriptions** - Prorated upgrades/downgrades and auto-renewals
+- 🌐 **Dashboard API** - Integrated FastAPI backend for the web dashboard
+- 🔐 **Secure Auth** - Token-based authentication between Bot and Dashboard
 - 📊 **Plan Details** - Detailed information for each subscription tier
-- 🎨 **Modern UI** - Glass-style button interface
 
 ### Admin Features
 - 🔐 **Admin Panel** - Dedicated control panel for administrators
@@ -24,42 +26,44 @@ A professional, modular Telegram bot for managing subscription plans with Postgr
 - 🔄 **Subscription Control** - Expire or cancel subscriptions
 
 ### Technical Features
-- 🏗️ **Modular Architecture** - Separated concerns (handlers, keyboards, database)
+- 🏗️ **Modular Architecture** - Separated concerns (handlers, database, api, payments)
+- 🚀 **Unified Runner** - Single entry point (`start.py`) for Bot and API
 - 🔄 **Auto Schema Init** - Automatic database initialization with fallback
 - 📝 **Comprehensive Logging** - File rotation and proper error tracking
-- ⚙️ **Background Jobs** - Auto-expiration and scheduled backups
-- 🛠️ **CLI Tools** - Command-line utilities for management
 - 🔒 **Connection Pooling** - Efficient async database connections
 
 ## 📁 Project Structure
 
+
 ```
 drelegrambot/
 ├── src/
-│   ├── __init__.py          # Package initialization
-│   ├── config.py            # Configuration management
-│   ├── database.py          # Database CRUD operations
-│   ├── keyboards.py         # Telegram keyboard layouts
-│   ├── handlers.py          # Command and callback handlers
-│   └── main.py              # Application entry point
-├── backups/                 # Database backups (auto-created)
-├── logs/                    # Application logs (auto-created)
-├── utils.py                 # CLI management tool
-├── schema.sql               # Database schema
-├── docker-compose.yaml      # PostgreSQL container
-├── requirements.txt         # Python dependencies
-├── .env                     # Environment configuration
-└── README.md                # This file
+│ ├── init.py # Package initialization
+│ ├── start.py # 🚀 Unified entry point (Runs Bot + API)
+│ ├── main.py # Bot polling logic
+│ ├── api.py # FastAPI backend endpoints
+│ ├── config.py # Configuration management
+│ ├── database.py # Database CRUD operations
+│ ├── handlers.py # Telegram command/callback handlers
+│ ├── keyboards.py # Telegram keyboard layouts
+│ ├── payment.py # Crypto gateway wrappers
+│ ├── payment_manager.py # 🧠 Business logic (Proration/Calculations)
+│ └── token_manager.py # 🔐 Secure token generation/hashing
+├── backups/ # Database backups (auto-created)
+├── logs/ # Application logs (auto-created)
+├── utils.py # CLI management tool
+├── schema.sql # Database schema
+├── docker-compose.yaml # PostgreSQL container
+├── requirements.txt # Python dependencies
+└── README.md # This file             # This file
 ```
-
 ## 🚀 Quick Start
 
 ### Prerequisites
 
-- Python 3.8 or higher
-- Docker and Docker Compose
+- [uv](https://github.com/astral-sh/uv) (Fast Python package installer)
+- Docker and Docker Compose (for PostgreSQL)
 - Telegram Bot Token (from [@BotFather](https://t.me/botfather))
-- Your Telegram User ID (from [@userinfobot](https://t.me/userinfobot))
 
 ### Installation
 
@@ -69,36 +73,16 @@ drelegrambot/
    cd telegram-subscription-bot
    ```
 
-2. **Install dependencies**
+2. **Initialize environment with uv**
    ```bash
-   pip install -r requirements.txt
+   # Create virtual environment and install dependencies
+   uv venv
+   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   uv pip install -r requirements.txt
    ```
 
-3. **Configure environment**
-   
-   Create `.env` file in project root:
-   ```env
-   # Bot Configuration
-   BOT_TOKEN=your_telegram_bot_token_here
-   
-   # Database Configuration
-   DATABASE_URL=postgresql://userdrelegram:yourpassword@localhost:9204/drelegrambotdb
-   DB_MIN_POOL_SIZE=2
-   DB_MAX_POOL_SIZE=10
-   DB_COMMAND_TIMEOUT=60
-   
-   # Admin Configuration (comma-separated Telegram user IDs)
-   ADMIN_USER_IDS=123456789,987654321
-   
-   # Backup Configuration
-   BACKUP_DIR=./backups
-   AUTO_BACKUP_ENABLED=true
-   AUTO_BACKUP_INTERVAL_HOURS=24
-   
-   # Logging Configuration
-   LOG_LEVEL=INFO
-   LOG_DIR=./logs
-   ```
+3. **Configure Environment**
+   Set the required environment variables (see [Configuration](#-configuration) below). You can export them in your shell or use your preferred environment manager.
 
 4. **Start PostgreSQL database**
    ```bash
@@ -107,13 +91,12 @@ drelegrambot/
 
 5. **Verify database connection**
    ```bash
-   python utils.py check
+   uv run python utils.py check
    ```
 
 6. **Run the bot**
    ```bash
-   cd src
-   python main.py
+   uv run python src/start.py
    ```
 
 ## 💳 Subscription Plans
@@ -143,58 +126,34 @@ drelegrambot/
 
 ## 🛠️ CLI Management Tools
 
-Run from project root:
-
-```bash
+Use `uv run` to execute management commands safely:
+```
 # Check database connection
-python utils.py check
+uv run python utils.py check
 
 # View statistics
-python utils.py stats
+uv run python utils.py stats
 
 # List recent users
-python utils.py users 20
+uv run python utils.py users 20
 
 # Create backup
-python utils.py backup
+uv run python utils.py backup
 
 # List all backups
-python utils.py list-backups
+uv run python utils.py list-backups
 
 # Restore from backup
-python utils.py restore backups/backup_20260107_120000.json
+uv run python utils.py restore backups/backup_20260107_120000.json
 
 # Restore and clear existing data
-python utils.py restore backups/backup_20260107_120000.json --clear
+uv run python utils.py restore backups/backup_20260107_120000.json --clear
 
 # Manually expire old subscriptions
-python utils.py expire
+uv run python utils.py expire
 
 # Show help
-python utils.py help
-```
-
-## 🗄️ Database Schema
-
-### Users Table
-```sql
-user_id BIGINT PRIMARY KEY
-username VARCHAR(255)
-email VARCHAR(255) UNIQUE
-created_at TIMESTAMP
-updated_at TIMESTAMP
-```
-
-### Subscriptions Table
-```sql
-id SERIAL PRIMARY KEY
-user_id BIGINT (FK to users)
-plan VARCHAR(50) (standard|pro|business+|enterprise+)
-status VARCHAR(20) (active|expired|cancelled)
-start_date TIMESTAMP
-end_date TIMESTAMP
-created_at TIMESTAMP
-updated_at TIMESTAMP
+uv run python utils.py help
 ```
 
 ## 📊 Features Breakdown
@@ -275,49 +234,13 @@ All configuration is managed through environment variables and `src/config.py`:
 
 ```bash
 # Test database connection
-python utils.py check
+uv run python utils.py check
 
 # View current stats
-python utils.py stats
+uv run python utils.py stats
 
 # Create test backup
-python utils.py backup
-```
-
-## 🐛 Troubleshooting
-
-### Database Connection Issues
-```bash
-# Check if database is running
-docker-compose ps
-
-# View database logs
-docker-compose logs postgres
-
-# Restart database
-docker-compose restart postgres
-```
-
-### Bot Not Starting
-```bash
-# Check configuration
-python utils.py check
-
-# View bot logs
-tail -f logs/bot.log
-
-# Verify bot token
-curl https://api.telegram.org/bot<YOUR_TOKEN>/getMe
-```
-
-### Import Errors
-```bash
-# Ensure you're in the correct directory
-cd src
-python main.py
-
-# Or use module syntax
-python -m src.main
+uv run python utils.py backup
 ```
 
 ## 📈 Production Deployment
@@ -360,15 +283,15 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - [python-telegram-bot](https://python-telegram-bot.org/) - Telegram Bot API wrapper
 - [asyncpg](https://github.com/MagicStack/asyncpg) - Fast PostgreSQL client
-- [python-dotenv](https://github.com/theskumar/python-dotenv) - Environment management
+- [uv](https://github.com/astral-sh/uv) - Fast Python package manager
 
 ## 📞 Support
 
 For questions and support:
-- 📧 Email: support@example.com
+- 📧 Email: [support@example.com](mailto:support@example.com)
 - 🐛 Issues: [GitHub Issues](https://github.com/yourusername/telegram-subscription-bot/issues)
 - 💬 Telegram: [@yourusername](https://t.me/yourusername)
 
 ---
 
-**Built with ❤️ using Python, PostgreSQL, and python-telegram-bot**
+**Built with ❤️ using Python, PostgreSQL, and uv**
