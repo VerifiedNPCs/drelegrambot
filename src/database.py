@@ -371,6 +371,39 @@ class DatabaseManager:
         except Exception as e:
             logger.exception(f"Error fetching subscription: {e}")
             return None
+        
+    async def cancel_subscription(self, user_id: int) -> bool:
+        """
+        Cancels the user's active subscription and logs the action.
+        Returns True if a subscription was cancelled, False if no active sub found.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                # 1. Update the subscription status
+                # We only cancel 'active' subscriptions
+                result = await conn.execute(
+                    """
+                    UPDATE subscriptions 
+                    SET status = 'cancelled' 
+                    WHERE user_id = $1 AND status = 'active'
+                    """,
+                    user_id
+                )
+                
+                # Check if a row was actually updated
+                if result == "UPDATE 0":
+                    return False
+
+                # 2. Add to Audit Log
+                await conn.execute(
+                    """
+                    INSERT INTO audit_logs (user_id, action_type, action_details)
+                    VALUES ($1, 'subscription_cancelled', 'User cancelled plan via Telegram Bot')
+                    """,
+                    user_id
+                )
+                
+                return True
 
     async def get_active_subscription(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Get user's active subscription"""

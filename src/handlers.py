@@ -6,6 +6,7 @@ from token_manager import TokenManager
 from payment_manager import PaymentManager
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from telegram.ext import ContextTypes
+from datetime import datetime, timezone
 
 from config import Config
 from keyboards import *
@@ -509,6 +510,57 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_menu_keyboard(user_id),
             parse_mode="HTML"
         )
+        
+        # --- Cancellation Logic ---
+    elif data == "cancel_plan_warning":
+        # 1. Check if they actually have an active plan first
+        subscription = await db_manager.get_active_subscription(user_id)
+        if not subscription:
+            await query.edit_message_text(
+                "⚠️ <b>Error</b>\n\nYou do not have an active subscription to cancel.",
+                reply_markup=get_main_menu_keyboard(user_id),
+                parse_mode="HTML"
+            )
+            return
+
+        # 2. Show the Warning Message
+        warning_msg = (
+            "⚠️ <b>ARE YOU SURE?</b>\n\n"
+            "You are about to cancel your subscription. \n\n"
+            "❗️ <b>This action cannot be undone.</b>\n"
+            "💸 <b>NO REFUNDS:</b> You will NOT receive money back for remaining days.\n"
+            "🛑 <b>Access Revoked:</b> Your access will be terminated immediately.\n\n"
+            "If you have billing issues, please contact @drele_gram instead."
+        )
+        
+        await query.edit_message_text(
+            text=warning_msg,
+            reply_markup=get_cancel_confirmation_keyboard(), # From your new keyboard.py
+            parse_mode="HTML"
+        )
+    # --- Cancellation Logic ---
+    elif data == "confirm_cancel_plan":
+        # 3. Execute Cancellation
+        success = await db_manager.cancel_subscription(user_id)
+        
+        if success:
+            msg = (
+                "✅ <b>Subscription Cancelled</b>\n\n"
+                "Your plan has been terminated effective immediately.\n"
+                "You will no longer be charged.\n\n"
+                "We are sorry to see you go!"
+            )
+        else:
+            msg = (
+                "⚠️ <b>Cancellation Failed</b>\n\n"
+                "Your subscription may have already expired or been cancelled."
+            )
+            
+        await query.edit_message_text(
+            text=msg,
+            reply_markup=get_main_menu_keyboard(user_id),
+            parse_mode="HTML"
+        )
 
     # --- Help ---
     elif data == "help":
@@ -566,6 +618,86 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_admin_keyboard(),
             parse_mode="HTML"
         )
+        
+    elif data == "admin_users":
+        if not Config.is_admin(user_id): 
+            await query.answer("❌ Admin only", show_alert=True)
+            return
+        
+        # Fetch users with pagination
+        users = await db_manager.get_all_users(limit=20)
+        total_users = await db_manager.count_users()
+        
+        if not users:
+            text = "📋 <b>User List</b>\n\n❌ No users found."
+        else:
+            text = f"👥 <b>User List</b> (Total: {total_users})\n\n"
+            
+            for idx, user in enumerate(users, 1):
+                # Get active subscription for this user
+                sub = await db_manager.get_active_subscription(user['user_id'])
+                plan_emoji = "❌"
+                plan_name = "No Plan"
+                
+                if sub:
+                    plan_info = Config.get_plan(sub['plan'])
+                    if plan_info:
+                        plan_emoji = plan_info['emoji']
+                        plan_name = plan_info['name']
+                
+                text += f"{idx}. @{user['username']} ({user['user_id']})\n"
+                text += f"   {plan_emoji} {plan_name} | {user['email']}\n\n"
+                
+                # Limit to prevent message overflow
+                if idx >= 15:
+                    text += f"... and {total_users - 15} more users"
+                    break
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=get_admin_keyboard(),
+            parse_mode="HTML"
+        )
+
+    elif data == "admin_subs":
+        if not Config.is_admin(user_id): 
+            await query.answer("❌ Admin only", show_alert=True)
+            return
+        
+        # Fetch all active subscriptions
+        async with db_manager.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT s.*, u.username, u.email 
+                FROM subscriptions s
+                JOIN users u ON s.user_id = u.user_id
+                WHERE s.status = 'active'
+                ORDER BY s.end_date ASC
+                LIMIT 20
+            """)
+        
+        if not rows:
+            text = "📋 <b>Active Subscriptions</b>\n\n❌ No active subscriptions found."
+        else:
+            text = f"✅ <b>Active Subscriptions</b> ({len(rows)})\n\n"
+            
+            for idx, sub in enumerate(rows, 1):
+                plan_info = Config.get_plan(sub['plan'])
+                days_left = (sub['end_date'] - datetime.now(timezone.utc)).days
+                
+                text += f"{idx}. @{sub['username']}\n"
+                text += f"   Plan: {plan_info['emoji']} {plan_info['name']}\n"
+                text += f"   Expires: {sub['end_date'].strftime('%Y-%m-%d')} ({days_left}d left)\n\n"
+                
+                if idx >= 10:
+                    text += f"... and {len(rows) - 10} more subscriptions"
+                    break
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=get_admin_keyboard(),
+            parse_mode="HTML"
+        )
+
 
 # ==========================================
 # Message Handlers

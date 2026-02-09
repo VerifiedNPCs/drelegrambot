@@ -33,6 +33,24 @@ def get_payment_plans_keyboard() -> InlineKeyboardMarkup:
     keyboard.append([InlineKeyboardButton("« Back", callback_data="my_account")])
     return InlineKeyboardMarkup(keyboard)
 
+def get_cancel_confirmation_keyboard() -> InlineKeyboardMarkup:
+    """Warning keyboard for cancellation"""
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "⚠️ YES, Cancel My Plan", 
+                callback_data="confirm_cancel_plan"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 No, Go Back", 
+                callback_data="subscription_status"
+            )
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 
 def get_main_menu_keyboard(user_id: int = None) -> InlineKeyboardMarkup:
     """Main menu with glass button style"""
@@ -46,10 +64,12 @@ def get_main_menu_keyboard(user_id: int = None) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 Plan Details", callback_data="plan_details"),
         ],
         [
-            InlineKeyboardButton("🌐 Dashboard & Pay", callback_data="open_dashboard"),
-            InlineKeyboardButton("⏰ Subscription Status", callback_data="subscription_status"),
+            InlineKeyboardButton("🌐 Dashboard", callback_data="open_dashboard"),
+            InlineKeyboardButton("❌ Cancel Subscription", callback_data="cancel_plan_warning"),
+            
         ],
         [
+            InlineKeyboardButton("⏰ Subscription Status", callback_data="subscription_status"),
             InlineKeyboardButton("ℹ️ Help", callback_data="help"),
         ]
     ]
