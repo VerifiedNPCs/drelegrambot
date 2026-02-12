@@ -131,8 +131,8 @@ class Config:
     # ==========================================
     # API Configuration
     # ==========================================
-    API_HOST = os.getenv("API_HOST", "localhost")
-    API_PORT = int(os.getenv("API_PORT", "3141"))
+    API_HOST = os.getenv("API_HOST", "0.0.0.0")
+    API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "3141")))
     
     # ==========================================
     # Admin Wallets (Set your actual wallet addresses here)

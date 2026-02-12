@@ -17,16 +17,22 @@ logger = logging.getLogger(__name__)
 def run_api():
     """Run FastAPI server"""
     import uvicorn
+    import os
     from config import Config
     
-    logger.info("🚀 Starting API Server...")
+    # Force use of PORT env var if available (Railway standard)
+    port = int(os.getenv("PORT", Config.API_PORT))
+    host = os.getenv("API_HOST", Config.API_HOST)
+
+    logger.info(f"🚀 Starting API Server on {host}:{port}...")
     uvicorn.run(
         "api:app",
-        host=Config.API_HOST,
-        port=Config.API_PORT,
-        reload=False,  # Disable reload in production
+        host=host,
+        port=port,
+        reload=False,
         log_level="info"
     )
+
 
 
 def run_bot():
