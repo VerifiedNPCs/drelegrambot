@@ -48,11 +48,16 @@ app = FastAPI(
 )
 
 # CORS configuration for React frontend
+origins = [
+    "http://localhost:5173",                  # Local Development
+    "http://127.0.0.1:5173",                  # Local Development IP
+    "https://drelegram.vercel.app",           # ✅ Your Vercel Domain (No trailing slash)
+    Config.FRONTEND_ORIGIN                    # Fallback to Env Var
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        Config.FRONTEND_ORIGIN
-    ],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
