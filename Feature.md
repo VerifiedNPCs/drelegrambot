@@ -60,7 +60,7 @@ $9.99 (Base) + (4 × $0.50) = **$11.99 / month total**.
 *Essential tools for individual traders starting out.*
 
 *   **Total Cost =** $9.99 Base + ($0.50 × Number of Coins)
-*   **Max Capacity:** 10 Currencies
+*   **Max Capacity:** 50 Currencies
 
 **Included Features:**
 *   ✅ **Real-Time Market Watch:** Basic Volume & % Change monitoring.
@@ -75,7 +75,7 @@ $9.99 (Base) + (4 × $0.50) = **$11.99 / month total**.
 *Advanced analysis for the dedicated trader.*
 
 *   **Total Cost =** $29.99 Base + ($1.50 × Number of Coins)
-*   **Max Capacity:** 50 Currencies
+*   **Max Capacity:** 100 Currencies
 
 **Included Features:**
 *   ✅ **Everything in Standard**
@@ -91,7 +91,7 @@ $9.99 (Base) + (4 × $0.50) = **$11.99 / month total**.
 *Power your VIP group with custom signals.*
 
 *   **Total Cost =** $79.99 Base + ($2.00 × Number of Coins)
-*   **Max Capacity:** 100 Currencies
+*   **Max Capacity:** 200 Currencies
 
 **Included Features:**
 *   ✅ **Everything in Pro**
