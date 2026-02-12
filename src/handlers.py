@@ -72,15 +72,162 @@ async def format_user_status(user_id: int) -> str:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command - shows main menu"""
     user = update.effective_user
+    user_id = user.id
+    username = user.username or f"user_{user_id}"
 
-    welcome_text = (
-        f"👋 Welcome {user.first_name}!\n\n"
-        "🎯 <b>Subscription Management Bot</b>\n\n"
-        "Manage your subscription plans with ease. "
-        "Choose from our flexible plans designed for your needs.\n\n"
-        "Select an option below:"
-    )
+    # Check if user exists in database
+    db_user = await db_manager.get_user(user_id)
 
+    if context.args:
+        deep_link = context.args[0]
+        
+        # Ensure user exists before handling deep links
+        if not db_user:
+            await db_manager.create_user(user_id, username, f"{user_id}@telegram.user")
+        
+        # ✅ Payment Success Deep Link
+        if deep_link == "payment_success":
+            subscription = await db_manager.get_active_subscription(user_id)
+            
+            if subscription:
+                days_left = await db_manager.get_days_left(user_id)
+                plan_info = Config.get_plan(subscription['plan'])
+                
+                success_text = (
+                    "✅ <b>Payment Successful!</b>\n\n"
+                    f"🎉 Your <b>{plan_info['name']}</b> subscription is now active!\n\n"
+                    f"📊 <b>Subscription Details:</b>\n"
+                    f"• Plan: {plan_info['emoji']} {plan_info['name']}\n"
+                    f"• Price: {plan_info['price']}\n"
+                    f"• Days Remaining: {days_left} days\n"
+                    f"• Expires: {subscription['end_date'].strftime('%Y-%m-%d')}\n\n"
+                    "Your premium features are ready to use! 🚀\n\n"
+                    "What would you like to do?"
+                )
+                
+                keyboard = [
+                    [InlineKeyboardButton("🌐 Open Dashboard", callback_data="open_dashboard")],
+                    [InlineKeyboardButton("📜 Payment History", callback_data="payment_history")],
+                    [InlineKeyboardButton("« Main Menu", callback_data="main_menu")],
+                ]
+                
+                await update.message.reply_text(
+                    success_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='HTML'
+                )
+                return
+            else:
+                # Payment successful but no subscription found (edge case)
+                await update.message.reply_text(
+                    "✅ Payment received!\n\n"
+                    "Your subscription is being activated. Please wait a moment...",
+                    reply_markup=get_main_menu_keyboard(),
+                    parse_mode='HTML'
+                )
+                return
+        
+        # ❌ Payment Failed Deep Link
+        elif deep_link == "payment_failed":
+            failed_text = (
+                "⚠️ <b>Payment Issue Detected</b>\n\n"
+                "We noticed there was an issue with your payment.\n\n"
+                "<b>Common Issues:</b>\n"
+                "• Insufficient amount sent\n"
+                "• Wrong wallet address\n"
+                "• Network delays (can take 10-30 minutes)\n"
+                "• Incorrect transaction hash\n\n"
+                "<b>What to do next:</b>\n"
+                "1️⃣ Check your wallet transaction history\n"
+                "2️⃣ Wait 15-30 minutes for blockchain confirmation\n"
+                "3️⃣ If you sent the correct amount, contact support\n\n"
+                "💬 <b>Need help?</b> Click the button below:"
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("💬 Contact Support", url="https://t.me/drele_gram")],
+                [InlineKeyboardButton("🔄 Try Payment Again", callback_data="view_plans")],
+                [InlineKeyboardButton("« Main Menu", callback_data="main_menu")],
+            ]
+            
+            await update.message.reply_text(
+                failed_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='HTML'
+            )
+            return
+        
+        # ⏱️ Payment Cancelled Deep Link
+        elif deep_link == "payment_cancelled":
+            cancelled_text = (
+                "❌ <b>Payment Cancelled</b>\n\n"
+                "No worries! You can start a new payment anytime.\n\n"
+                "Ready to subscribe?"
+            )
+            
+            await update.message.reply_text(
+                cancelled_text,
+                reply_markup=get_plans_keyboard(),
+                parse_mode='HTML'
+            )
+            return
+        
+        # 📊 Subscription Status Deep Link
+        elif deep_link == "subscription":
+            subscription = await db_manager.get_active_subscription(user_id)
+            
+            if subscription:
+                days_left = await db_manager.get_days_left(user_id)
+                plan_info = Config.get_plan(subscription['plan'])
+                
+                status_text = (
+                    "📊 <b>Subscription Status</b>\n\n"
+                    f"✅ Active: {plan_info['emoji']} {plan_info['name']}\n"
+                    f"💰 Price: {plan_info['price']}\n"
+                    f"⏰ Days Left: {days_left}\n"
+                    f"📆 Expires: {subscription['end_date'].strftime('%Y-%m-%d')}"
+                )
+                
+                keyboard = [
+                    [InlineKeyboardButton("🔄 Renew/Upgrade", callback_data="view_plans")],
+                    [InlineKeyboardButton("🌐 Open Dashboard", callback_data="open_dashboard")],
+                    [InlineKeyboardButton("« Main Menu", callback_data="main_menu")],
+                ]
+                
+                await update.message.reply_text(
+                    status_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='HTML'
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ <b>No Active Subscription</b>\n\n"
+                    "You don't have an active subscription yet.\n"
+                    "Choose a plan to get started!",
+                    reply_markup=get_plans_keyboard(),
+                    parse_mode='HTML'
+                )
+            return
+    
+    # Default behavior (no deep link or new user)
+    if not db_user:
+        # New user - create account
+        await db_manager.create_user(user_id, username, f"{user_id}@telegram.user")
+        
+        welcome_text = (
+            f"👋 <b>Welcome {user.first_name}!</b>\n\n"
+            "🎯 Your account has been created!\n\n"
+            "Manage your subscription plans with ease. "
+            "Choose from our flexible plans designed for your needs.\n\n"
+            "Select an option below:"
+        )
+    else:
+        # Returning user
+        welcome_text = (
+            f"👋 <b>Welcome back, {user.first_name}!</b>\n\n"
+            "What would you like to do today?"
+        )
+    
     try:
         if update.message:
             await update.message.reply_text(

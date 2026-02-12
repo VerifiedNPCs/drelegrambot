@@ -13,6 +13,8 @@ from config import Config
 from database import DatabaseManager
 from token_manager import TokenManager
 from contextlib import asynccontextmanager
+from crypto_manager import CryptoManager
+from transaction_verifier import TransactionVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -457,57 +459,146 @@ async def get_payment_details(payment_id: str):
 
 @app.post("/api/payment/confirm")
 async def confirm_payment(data: dict):
-    """
-    Confirm payment and activate subscription.
-    """
-    logger.info(f"Received Payment Confirmation: {data}") # LOGGING ADDED
-    
     payment_id = data.get("payment_id")
-    status = data.get("status")
     tx_hash = data.get("tx_hash")
     
-    if not payment_id or status not in ['confirmed', 'failed']:
-        raise HTTPException(status_code=400, detail="Invalid data")
+    if not payment_id or not tx_hash:
+        raise HTTPException(status_code=400, detail="Missing data")
     
-    # 1. Fetch Payment Request Info
+    # 1. Get payment details
     payment_req = await db_manager.get_payment_request(payment_id)
     if not payment_req:
-        logger.error(f"Payment ID {payment_id} not found")
-        raise HTTPException(status_code=404, detail="Payment request not found")
-
-    # 2. Update status in DB
-    await db_manager.update_payment_request(
-        payment_id=payment_id,
-        status=status,
-        metadata={"tx_hash": tx_hash}
+        raise HTTPException(status_code=404, detail="Payment not found")
+    
+    # 2. Get expected amounts
+    usd_amount = float(payment_req['amount'])
+    crypto_currency = payment_req['crypto_currency']
+    
+    # Recalculate crypto amount with current rate (for verification)
+    rates = await CryptoManager.get_exchange_rates()
+    expected_crypto = CryptoManager.calculate_crypto_amount(usd_amount, rates[crypto_currency])
+    
+    wallet_address = Config.ADMIN_WALLETS.get(crypto_currency, "")
+    
+    # 3. VERIFY WITH TOLERANCE
+    verification = await TransactionVerifier.verify_transaction(
+        tx_hash=tx_hash,
+        crypto_currency=crypto_currency,
+        expected_address=wallet_address,
+        expected_amount=expected_crypto,
+        expected_usd_value=usd_amount  # Pass USD value for fee calculation
     )
     
-    if status == 'confirmed':
-        logger.info(f"Payment {payment_id} confirmed. Activating subscription...")
+    if not verification["valid"]:
+        # Check if it needs manual review
+        if verification.get("details", {}).get("manual_review"):
+            # Create a pending review record
+            await db_manager.create_notification(
+                user_id=payment_req['user_id'],
+                notification_type="payment_review",
+                title="Payment Under Review",
+                message=f"Your payment is being manually reviewed. TX: {tx_hash}",
+                priority="high"
+            )
+            return {
+                "success": False,
+                "message": "Payment requires manual verification. You will be notified within 24 hours.",
+                "manual_review": True
+            }
         
-        # 3. Create Transaction Record
-        await db_manager.create_transaction(
-            user_id=payment_req['user_id'],
-            payment_request_id=payment_req['id'], 
-            amount=float(payment_req['amount']),
-            currency=payment_req['currency'],
-            tx_hash=tx_hash,
-            gateway_name="manual_crypto"
-        )
+        raise HTTPException(status_code=400, detail=verification["message"])
+    
+    # 4. APPROVED - Activate subscription
+    logger.info(f"✅ Payment verified: {verification}")
+    
+    await db_manager.create_transaction(
+        user_id=payment_req['user_id'],
+        payment_request_id=payment_req['id'],
+        amount=usd_amount,
+        currency="USD",
+        crypto_currency=crypto_currency,
+        crypto_amount=expected_crypto,
+        tx_hash=tx_hash,
+        gateway_name="crypto_verified"
+    )
+    
+    plan_info = Config.get_plan(payment_req['plan'])
+    await db_manager.create_subscription(
+        user_id=payment_req['user_id'],
+        plan=payment_req['plan'],
+        duration_days=plan_info['duration_days']
+    )
+    
+    user = await db_manager.get_user(payment_req['user_id'])
+    
+    dashboard_token = TokenManager.generate_secure_token(
+        user_id=payment_req['user_id'], 
+        username=user['username'], 
+        token_type="dashboard"
+    )
+    dashboard_token_hash = TokenManager.hash_token(dashboard_token)
+    
+    await db_manager.create_user_token(
+        user_id=payment_req['user_id'],
+        token_hash=dashboard_token_hash,
+        token_type="dashboard",
+        expires_hours=24
+    )
+    
+    logger.info(f"🎫 Dashboard token issued for user {payment_req['user_id']}")
+    
+    return {
+        "success": True,
+        "message": "Payment verified and subscription activated",
+        "dashboard_token": dashboard_token
+    }
+
+@app.get("/api/payment/{payment_id}/crypto-options")
+async def get_crypto_options(payment_id: str):
+    """
+    Returns available crypto payment options with real-time conversion
+    and destination wallets.
+    """
+    # 1. Get the payment request to know the USD amount
+    payment = await db_manager.get_payment_request(payment_id)
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
         
-        # 4. Activate Subscription
-        plan_info = Config.get_plan(payment_req['plan'])
+    usd_amount = float(payment['amount'])
+    
+    # 2. Get Real-time Rates
+    rates = await CryptoManager.get_exchange_rates()
+    
+    # 3. Build Response Options
+    options = []
+    
+    # Define assets metadata
+    assets_meta = [
+        {"id": "btc", "name": "Bitcoin", "network": "Bitcoin Network", "icon": "currency_bitcoin"},
+        {"id": "eth", "name": "Ethereum", "network": "ERC-20", "icon": "diamond"},
+        {"id": "usdt", "name": "Tether (USDT)", "network": "BSC-20", "icon": "attach_money"},
+        {"id": "ltc", "name": "Litecoin", "network": "Litecoin Network", "icon": "monetization_on"},
+    ]
+    
+    for asset in assets_meta:
+        ticker = asset['id']
+        rate = rates.get(ticker, 0)
         
-        # Calculate start/end dates
-        sub = await db_manager.create_subscription(
-            user_id=payment_req['user_id'],
-            plan=payment_req['plan'],
-            duration_days=plan_info['duration_days']
-        )
-        
-        logger.info(f"Subscription activated for User {payment_req['user_id']}")
-        
-    return {"success": True}
+        if rate > 0:
+            crypto_amount = CryptoManager.calculate_crypto_amount(usd_amount, rate)
+            
+            options.append({
+                **asset,
+                "rate": rate,
+                "crypto_amount": crypto_amount,
+                "wallet_address": Config.ADMIN_WALLETS.get(ticker, "")
+            })
+            
+    return {
+        "payment_id": payment_id,
+        "usd_amount": usd_amount,
+        "options": options
+    }
 # ==========================================
 # HEALTH CHECK
 # ==========================================

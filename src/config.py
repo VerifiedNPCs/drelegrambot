@@ -133,8 +133,50 @@ class Config:
     # ==========================================
     API_HOST = os.getenv("API_HOST", "localhost")
     API_PORT = int(os.getenv("API_PORT", "3141"))
-
-
+    
+    # ==========================================
+    # Admin Wallets (Set your actual wallet addresses here)
+    # ==========================================
+    ADMIN_WALLETS = {
+        "btc": "", 
+        "eth": "", 
+        "usdt": "0x1e6beaa0a4671620ccfe025d4087054b99f3ae77",       # BSC 
+        "ltc": "ltc1qee5k9v4hnyjcznhgmn2vspjukkwkejedgvynnr" # litecoin, REPLACE
+    }
+    
+    # ==========================================
+    # Crypto Payment Configuration
+    # ==========================================
+    # DEV MODE (Set to False in production)
+    DEV_MODE = os.getenv("DEV_MODE", "True").lower() == "true"
+    TEST_TX_HASH = "sepigoli314fiif9482933#@@8498fufhnvnBUFUEI#*8e98fhIUHFOh8ife83o2jf38f9j29f8ijsjffsajslkcvi32903#"
+    
+    # API Keys (Get free keys from blockchain explorers)
+    ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
+    
+    
+    # ==========================================
+    # PAYMENT VERIFICATION SETTINGS
+    # ==========================================
+    PAYMENT_TOLERANCE = {
+        "btc": {
+            "percentage": 0.02,  # Allow 2% deviation (price fluctuation + rounding)
+            "min_shortfall_usd": 5.0  # Accept if within $5 USD equivalent
+        },
+        "eth": {
+            "percentage": 0.02,
+            "min_shortfall_usd": 5.0
+        },
+        "usdt": {
+            "percentage": 0.01,  # 1% for stablecoins (less volatility)
+            "min_shortfall_usd": 2.0  # USDT fees are usually $1-2
+        },
+        "ltc": {
+            "percentage": 0.02,
+            "min_shortfall_usd": 3.0
+        }
+    }
+    
     @classmethod
     def validate(cls) -> bool:
         """Validate required configuration values"""
