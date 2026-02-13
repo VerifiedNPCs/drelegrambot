@@ -1,4 +1,3 @@
-# image_generator.py
 import matplotlib
 # Set backend to Agg for non-interactive, headless generation (MUST be first)
 matplotlib.use('Agg')
@@ -8,7 +7,7 @@ mplstyle.use('fast')
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, Polygon
 from matplotlib.lines import Line2D
 import io
 import numpy as np
@@ -379,7 +378,7 @@ class MarketImageGenerator:
         else:
             t(self.X_LIQ + (self.W_LIQ/2), y, "-", color=self.SUB_TEXT_COLOR, fontsize=11, ha='center', va='center')
 
-        # 2. Sparklines (Direct Line Drawing)
+        # 2. Sparklines (Direct Line Drawing + Shadow)
         history = item.get('history', [])
         if isinstance(history, np.ndarray): history = history.tolist()
         hist_clean = [float(x) for x in history[-20:] if _safe_float(x) is not None and x > 0]
@@ -400,11 +399,24 @@ class MarketImageGenerator:
             
             line_color = self.GREEN if hist_clean[-1] >= hist_clean[0] else self.RED
             
-            # Add Line
-            self.ax.add_line(Line2D(x_vals, y_vals, color=line_color, lw=1.5))
+            # -- SHADOW (Polygon) --
+            # Create a closed polygon: [Start, Points..., End, Start]
+            # We want it to go down to sp_y_bottom (the floor of the sparkline area)
             
-            # Note: fill_between is hard to optimize with Line2D on shared axis without creating a complex PathPatch.
-            # Omitting transparency fill for pure speed. If critical, use PolyCollection, but Line2D is 10x faster.
+            # Add first point (bottom-left)
+            poly_points = [(x_vals[0], sp_y_bottom)]
+            # Add line points
+            poly_points.extend(zip(x_vals, y_vals))
+            # Add last point (bottom-right)
+            poly_points.append((x_vals[-1], sp_y_bottom))
+            
+            # Add Polygon Patch (Fast Shadow)
+            poly = Polygon(poly_points, closed=True, facecolor=line_color, edgecolor=None, alpha=0.15)
+            self.ax.add_patch(poly)
+            
+            # -- LINE --
+            self.ax.add_line(Line2D(x_vals, y_vals, color=line_color, lw=1.5))
+
 
         # 3. Range Bar (Direct Drawing)
         range_center_x = self.X_RANGE + (self.W_RANGE / 2)
