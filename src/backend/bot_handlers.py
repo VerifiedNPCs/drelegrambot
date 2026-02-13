@@ -78,16 +78,21 @@ async def _send_leaderboard_image(context, chat_id, tf, img_data, caption):
             return
 
         await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
-        loop = asyncio.get_running_loop()
         
-        # Enrich Data (Async)
-        await image_generator.enrich_data(img_data, services.COLLECTOR, config.DEPTH_TARGET_USDT)
+        # --- NEW: GENERATE CACHE KEY ---
+        # Create a unique key based on the content. 
+        # For leaderboards: "top_1h", "vol_4h" etc. 
+        # For symbols: "SYM_BTCUSDT_1h" etc.
+        # We can approximate this by hashing the first symbol + TF + length
+        first_sym = img_data[0]['symbol'] if img_data else "NONE"
+        cache_key = f"{tf}_{first_sym}_{len(img_data)}_{caption[:10]}"
 
-        # Generate Image (Thread Pool)
-        photo_buf = await loop.run_in_executor(
-            services.IMG_EXECUTOR,
-            image_generator.generate_market_image,
-            img_data
+        # --- NEW: USE CACHED SERVICE ---
+        # This replaces the manual enrich + run_in_executor calls
+        photo_buf = await services.get_generated_image(
+            cache_key, 
+            img_data, 
+            config.DEPTH_TARGET_USDT
         )
 
         if photo_buf:

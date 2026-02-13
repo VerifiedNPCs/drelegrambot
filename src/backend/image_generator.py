@@ -1,9 +1,15 @@
-#image_generator.py
+# image_generator.py
 import matplotlib
+# Set backend to Agg for non-interactive, headless generation (MUST be first)
 matplotlib.use('Agg')
+import matplotlib.style as mplstyle
+# Use 'fast' style to disable unnecessary features
+mplstyle.use('fast')
+
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
-import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
 import io
 import numpy as np
 import re
@@ -11,15 +17,21 @@ import logging
 import gc
 import asyncio
 from typing import List, Dict, Any
-from config import setup_logging
 
-logger = setup_logging("ImageGen")
+# Keep your existing imports
+try:
+    from config import setup_logging
+    logger = setup_logging("ImageGen")
+except ImportError:
+    # Fallback if config is missing during testing
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("ImageGen")
+
 # ------------------------------------------------------------------------------
-# Data Enrichment Logic (Moved from Bot)
+# Data Enrichment Logic (Preserved)
 # ------------------------------------------------------------------------------
 
 def _normalize_symbol(sym: str) -> str:
-    """Ensures symbol is uppercase and ends with USDT."""
     s = (sym or "").upper().strip()
     if not s:
         return s
@@ -28,9 +40,6 @@ def _normalize_symbol(sym: str) -> str:
     return s
 
 async def _enrich_with_liquidations(img_data: List[Dict], collector: Any) -> None:
-    """
-    Populates 'liq_1h_long', 'liq_1h_short' from the collector's liquidation monitor.
-    """
     if not img_data or not collector:
         return
     
@@ -40,7 +49,6 @@ async def _enrich_with_liquidations(img_data: List[Dict], collector: Any) -> Non
         if not sym: continue
 
         try:
-            # Requires get_liq_stats() to be implemented in Data_Collector
             if hasattr(collector, 'get_liq_stats'):
                 stats = collector.get_liq_stats(sym)
                 if stats:
@@ -54,13 +62,9 @@ async def _enrich_with_liquidations(img_data: List[Dict], collector: Any) -> Non
             pass
 
 async def _enrich_with_depth(img_data: List[Dict], collector: Any, target_usdt: float) -> None:
-    """
-    Adds depth/liquidity data to image rows by checking the collector's order book.
-    """
     if not img_data or not collector:
         return
 
-    # Extract symbols needing depth check
     syms = []
     for row in img_data:
         ds = row.get("depth_symbol") or row.get("symbol_raw") or row.get("symbol")
@@ -71,27 +75,22 @@ async def _enrich_with_depth(img_data: List[Dict], collector: Any, target_usdt: 
         if base:
             syms.append(base)
 
-    # De-duplicate
     uniq = list(set(syms))
     if not uniq:
         return
 
-    # Cap watchlist size to prevent overload
     MAX_WATCHLIST = 20
     if len(uniq) > MAX_WATCHLIST:
         uniq = uniq[:MAX_WATCHLIST]
 
     try:
-        # Tell collector to watch these symbols on Futures WebSocket
         if hasattr(collector, 'set_depth_watchlist'):
             await collector.set_depth_watchlist(uniq)
-            # Brief pause to let WS connect/snapshot
             await asyncio.sleep(0.5)
     except Exception:
         logger.exception("Failed to set depth watchlist")
         return
 
-    # Fetch data
     for row in img_data:
         try:
             ds = row.get("depth_symbol") or row.get("symbol_raw") or row.get("symbol")
@@ -107,12 +106,9 @@ async def _enrich_with_depth(img_data: List[Dict], collector: Any, target_usdt: 
             if not isinstance(mid_hint, (int, float)) or mid_hint <= 0:
                 mid_hint = None
 
-            # Get liquidity range from Collector's in-memory book
             rng = None
             if hasattr(collector, 'get_depth_liquidity_range'):
                 rng = collector.get_depth_liquidity_range(base, target_usdt, mid_price=mid_hint)
-
-                # Optional retry if data missing initially
                 if rng is None:
                     await asyncio.sleep(0.1)
                     rng = collector.get_depth_liquidity_range(base, target_usdt, mid_price=mid_hint)
@@ -120,7 +116,6 @@ async def _enrich_with_depth(img_data: List[Dict], collector: Any, target_usdt: 
             row["depth_target_usdt"] = float(target_usdt)
 
             if rng is None:
-                # Fill Nones so generator handles it gracefully
                 row.update({
                     "depth_down_price": None, "depth_up_price": None,
                     "depth_down_pct": None, "depth_up_pct": None
@@ -144,58 +139,38 @@ async def _enrich_with_depth(img_data: List[Dict], collector: Any, target_usdt: 
             logger.exception("Depth enrichment failed for row: %s", row.get("symbol"))
 
 async def enrich_data(img_data: List[Dict], collector: Any, target_usdt: float) -> None:
-    """
-    Public entry point to enrich data before generation.
-    Call this from the bot before calling generate_market_image.
-    """
     await _enrich_with_depth(img_data, collector, target_usdt)
     await _enrich_with_liquidations(img_data, collector)
-
 
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
 def clean_text(text):
-    """Removes non-ASCII characters to prevent Matplotlib warnings."""
     if not isinstance(text, str):
         return str(text)
     return re.sub(r'[^\x00-\x7F]+', '', text).strip()
 
-
 def fmt_large_num(num):
-    """Formats large numbers (Volume / Notional) like 1.2M, 500K."""
     try:
         num = float(num)
     except Exception:
         return "0"
-    if num >= 1_000_000_000:
-        return f"{num/1_000_000_000:.1f}B"
-    if num >= 1_000_000:
-        return f"{num/1_000_000:.1f}M"
-    if num >= 1_000:
-        return f"{num/1_000:.0f}K"
+    if num >= 1_000_000_000: return f"{num/1_000_000_000:.1f}B"
+    if num >= 1_000_000: return f"{num/1_000_000:.1f}M"
+    if num >= 1_000: return f"{num/1_000:.0f}K"
     return f"{num:.0f}"
 
-
 def fmt_price_extended(val):
-    """Smart price formatting."""
     try:
         val = float(val)
     except Exception:
         return "0.00"
-
-    if val == 0:
-        return "0.00"
-    if val < 0.0001:
-        return f"{val:.8f}"
-    if val < 0.01:
-        return f"{val:.6f}"
-    if val < 1:
-        return f"{val:.4f}"
-    if val < 100:
-        return f"{val:.2f}"
+    if val == 0: return "0.00"
+    if val < 0.0001: return f"{val:.8f}"
+    if val < 0.01: return f"{val:.6f}"
+    if val < 1: return f"{val:.4f}"
+    if val < 100: return f"{val:.2f}"
     return f"{val:,.0f}"
-
 
 def _safe_float(x, default=None):
     try:
@@ -206,303 +181,294 @@ def _safe_float(x, default=None):
     except Exception:
         return default
 
-
 def _depth_available(item: dict) -> bool:
-    """Checks if row has valid depth fields for liquidity bar."""
     dp = item.get("depth_down_price", None)
     up = item.get("depth_up_price", None)
     return _safe_float(dp, None) is not None and _safe_float(up, None) is not None
 
-
 # ------------------------------------------------------------------------------
-# Core Generator
+# Optimized Generator Class
 # ------------------------------------------------------------------------------
-def generate_market_image(data_list):
+class MarketImageGenerator:
     """
-    Generates a market snapshot image using Matplotlib (OO Interface).
-    Supports RSI, MFI, ADX, Sparklines, Liquidity/Range bars, and Liquidation Ratios.
+    Optimized generator that reuses Figure instances and uses direct 
+    coordinate drawing to avoid expensive Axes creation.
     """
-    if not data_list:
-        return None
+    def __init__(self):
+        # Constants
+        self.ROW_HEIGHT = 0.6
+        self.HEADER_HEIGHT = 0.8
+        self.FIG_W = 20
+        self.BG_COLOR = '#0e1117'
+        self.TEXT_COLOR = '#ffffff'
+        self.SUB_TEXT_COLOR = "#A1A1A1"
+        self.DIVIDER_COLOR = '#222222'
+        self.RED = '#ff4d4d'
+        self.GREEN = '#00ff7f'
+        self.YELLOW = '#ffd700'
+        self.BLUE = '#00bfff'
+        self.BAR_GREY = '#444444'
+        self.MID_DOT = '#ffffff'
 
-    # --- CONSTANTS & CONFIG ---
-    ROWS = len(data_list)
-    ROW_HEIGHT = 0.6
-    HEADER_HEIGHT = 0.8
-    FIG_H = (ROWS * ROW_HEIGHT) + HEADER_HEIGHT
-    FIG_W = 20  # Width
+        # Layout X Positions
+        self.X_SYM = 0.02
+        self.X_TF = 0.08
+        self.X_PRICE = 0.16
+        self.X_CHG = 0.22
+        self.X_VOL = 0.28
+        self.X_RSI = 0.35
+        self.X_MFI = 0.40
+        self.X_ADX = 0.45
+        self.X_LIQ = 0.52
+        self.W_LIQ = 0.10
+        self.X_SPARK = 0.65
+        self.W_SPARK = 0.12
+        self.X_RANGE = 0.84
+        self.W_RANGE = 0.12
 
-    # Liquidity bar scaling: 5% distance fills the half-bar
-    LIQ_MAX_PCT_DISPLAY = 5.0
+        # Initialize Figure ONCE
+        # We start with a default size, will resize if needed
+        self.fig = Figure(figsize=(self.FIG_W, 10), dpi=100)
+        self.canvas = FigureCanvasAgg(self.fig)
+        self.fig.patch.set_facecolor(self.BG_COLOR)
+        
+        # Single main axis for everything
+        self.ax = self.fig.add_axes([0, 0, 1, 1])
+        self.ax.axis('off')
 
-    # Colors
-    BG_COLOR = '#0e1117'
-    TEXT_COLOR = '#ffffff'
-    SUB_TEXT_COLOR = "#A1A1A1"
-    GREEN = '#00ff7f'
-    RED = '#ff4d4d'
-    YELLOW = '#ffd700'
-    BLUE = '#00bfff'
-    DIVIDER_COLOR = '#222222'
-    MID_DOT = '#ffffff'
-    BAR_GREY = '#444444'
+    def render(self, data_list: List[Dict]) -> io.BytesIO:
+        if not data_list:
+            return None
 
-    # Layout Positions (0.0 to 1.0)
-    X_SYM = 0.02
-    X_TF = 0.08
-    X_PRICE = 0.16
-    X_CHG = 0.22
-    X_VOL = 0.28
-    
-    # Indicators
-    X_RSI = 0.35
-    X_MFI = 0.40
-    X_ADX = 0.45
+        rows_count = len(data_list)
+        needed_height = (rows_count * self.ROW_HEIGHT) + self.HEADER_HEIGHT
+        
+        # Resize figure if the height requirement changed significantly
+        # (Avoid resizing for micro-adjustments to save speed)
+        curr_w, curr_h = self.fig.get_size_inches()
+        if abs(curr_h - needed_height) > 0.1:
+            self.fig.set_size_inches(self.FIG_W, needed_height)
+        
+        # Clear previous content
+        self.ax.clear()
+        self.ax.axis('off')
+        self.ax.set_xlim(0, 1)
+        self.ax.set_ylim(0, 1)
 
-    # New Liquidation Column
-    X_LIQ = 0.52 
-    W_LIQ = 0.10
+        # Pre-calculation for Y coordinates
+        # Map 0..1 to the figure coordinates
+        # In Matplotlib 0,0 is bottom-left.
+        # We draw from top down.
+        
+        header_y = 1.0 - (0.5 / needed_height)
+        line_y = header_y - (0.3 / needed_height)
+        
+        # Draw Header Divider
+        self.ax.plot([0.02, 0.98], [line_y, line_y], color=self.DIVIDER_COLOR, lw=1)
+        
+        # Draw Headers
+        self._draw_headers(header_y)
 
-    # Charts (Small)
-    X_SPARK = 0.65
-    W_SPARK = 0.12
-    X_RANGE = 0.84
-    W_RANGE = 0.12
+        # Draw Rows
+        row_start_y = line_y - (0.4 / needed_height)
+        y_step = self.ROW_HEIGHT / needed_height
+        
+        # Optimization: Collect patch objects and add them in batches if possible, 
+        # or just add iteratively. Iterative add_patch is fast enough for <100 objects.
+        
+        for i, item in enumerate(data_list):
+            y = row_start_y - (i * y_step)
+            self._draw_row(i, item, y, y_step, needed_height)
 
-    # --- FIGURE INITIALIZATION ---
-    # Use Figure directly (no pyplot) to avoid memory leaks
-    fig = Figure(figsize=(FIG_W, FIG_H), dpi=100)
-    canvas = FigureCanvasAgg(fig)
-    fig.patch.set_facecolor(BG_COLOR)
+        # Output to buffer
+        buf = io.BytesIO()
+        try:
+            self.canvas.print_png(buf)
+            buf.seek(0)
+            return buf
+        except Exception:
+            logger.exception("Failed to render PNG image")
+            return None
+        # No need to close/clf/gc.collect() - we reuse self.fig
 
-    # Main Axes for Text
-    ax_bg = fig.add_axes([0, 0, 1, 1])
-    ax_bg.axis('off')
-    ax_bg.set_xlim(0, 1)
-    ax_bg.set_ylim(0, 1)
+    def _draw_headers(self, y):
+        """Draws the table headers."""
+        bold = 'bold'
+        size = 11
+        sub = self.SUB_TEXT_COLOR
+        
+        t = self.ax.text
+        t(self.X_SYM, y, "SYMBOL", color=sub, fontsize=size, fontweight=bold, ha='left', va='center')
+        t(self.X_TF, y, "TF", color=sub, fontsize=size, fontweight=bold, ha='left', va='center')
+        t(self.X_PRICE, y, "PRICE", color=sub, fontsize=size, fontweight=bold, ha='right', va='center')
+        t(self.X_CHG, y, "24H %", color=sub, fontsize=size, fontweight=bold, ha='right', va='center')
+        t(self.X_VOL, y, "VOL ($)", color=sub, fontsize=size, fontweight=bold, ha='right', va='center')
+        t(self.X_RSI, y, "RSI", color=sub, fontsize=size, fontweight=bold, ha='center', va='center')
+        t(self.X_MFI, y, "MFI", color=sub, fontsize=size, fontweight=bold, ha='center', va='center')
+        t(self.X_ADX, y, "ADX", color=sub, fontsize=size, fontweight=bold, ha='center', va='center')
+        
+        t(self.X_LIQ + (self.W_LIQ/2), y, "LIQ (1H)", color=sub, fontsize=size, fontweight=bold, ha='center', va='center')
+        t(self.X_SPARK + (self.W_SPARK/2), y, "TREND", color=sub, fontsize=size, fontweight=bold, ha='center', va='center')
+        t(self.X_RANGE + (self.W_RANGE/2), y, "RANGE", color=sub, fontsize=size, fontweight=bold, ha='center', va='center')
 
-    # --- HEADER ---
-    header_y = 1.0 - (0.5 / FIG_H)
-
-    def add_text(x, y, text, color=TEXT_COLOR, size=11, weight='normal', align='left'):
-        ax_bg.text(
-            x, y, str(text),
-            color=color, fontsize=size, fontweight=weight,
-            ha=align, va='center'
-        )
-
-    # Draw Headers
-    add_text(X_SYM, header_y, "SYMBOL", SUB_TEXT_COLOR, 11, 'bold', 'left')
-    add_text(X_TF, header_y, "TF", SUB_TEXT_COLOR, 11, 'bold', 'left')
-    add_text(X_PRICE, header_y, "PRICE", SUB_TEXT_COLOR, 11, 'bold', 'right')
-    add_text(X_CHG, header_y, "24H %", SUB_TEXT_COLOR, 11, 'bold', 'right')
-    add_text(X_VOL, header_y, "VOL ($)", SUB_TEXT_COLOR, 11, 'bold', 'right')
-
-    add_text(X_RSI, header_y, "RSI", SUB_TEXT_COLOR, 11, 'bold', 'center')
-    add_text(X_MFI, header_y, "MFI", SUB_TEXT_COLOR, 11, 'bold', 'center')
-    add_text(X_ADX, header_y, "ADX", SUB_TEXT_COLOR, 11, 'bold', 'center')
-
-    # Liquidation Header
-    liq_center = X_LIQ + (W_LIQ / 2)
-    add_text(liq_center, header_y, "LIQ (1H)", SUB_TEXT_COLOR, 11, 'bold', 'center')
-
-    trend_center = X_SPARK + (W_SPARK / 2)
-    add_text(trend_center, header_y, "TREND", SUB_TEXT_COLOR, 11, 'bold', 'center')
-
-    range_center = X_RANGE + (W_RANGE / 2)
-    add_text(range_center, header_y, "RANGE", SUB_TEXT_COLOR, 11, 'bold', 'center')
-
-    # Header Divider Line
-    line_y = header_y - (0.3 / FIG_H)
-    ax_bg.plot([0.02, 0.98], [line_y, line_y], color=DIVIDER_COLOR, lw=1)
-
-    # --- ROWS ---
-    row_start_y = line_y - (0.4 / FIG_H)
-    y_step = ROW_HEIGHT / FIG_H
-
-    for i, item in enumerate(data_list):
-        y = row_start_y - (i * y_step)
-
-        # Extract Data
-        raw_symbol = item.get('symbol', 'N/A')
-        symbol = clean_text(raw_symbol)
+    def _draw_row(self, i, item, y, y_step, total_h):
+        """Draws a single data row."""
+        # --- Data Extraction ---
+        symbol = clean_text(item.get('symbol', 'N/A'))
         tf = clean_text(item.get('tf', ''))
         price = _safe_float(item.get('price', 0), 0.0) or 0.0
         change = _safe_float(item.get('change', 0), 0.0) or 0.0
         usdt_vol = _safe_float(item.get('usdt_volume', 0), 0.0) or 0.0
-
         rsi = _safe_float(item.get('rsi', 50), 50.0) or 50.0
         mfi = _safe_float(item.get('mfi', 50), 50.0) or 50.0
         adx = _safe_float(item.get('adx', 0), 0.0) or 0.0
-        history = item.get('history', [])
+        
+        is_up = change >= 0
+        val_color = self.GREEN if is_up else self.RED
+        
+        # --- Text Columns ---
+        t = self.ax.text
+        t(self.X_SYM, y, symbol, color='white', fontsize=12, fontweight='bold', ha='left', va='center')
+        t(self.X_TF, y, tf, color=self.SUB_TEXT_COLOR, fontsize=11, ha='left', va='center')
+        t(self.X_PRICE, y, f"${fmt_price_extended(price)}", color='white', fontsize=12, ha='right', va='center')
+        t(self.X_CHG, y, f"{change:+.2f}%", color=val_color, fontsize=12, ha='right', va='center')
+        t(self.X_VOL, y, fmt_large_num(usdt_vol), color='white', fontsize=11, ha='right', va='center')
 
-        # Liquidation Data (New)
+        # Indicators
+        rsi_c = self.RED if rsi > 70 else (self.GREEN if rsi < 30 else self.TEXT_COLOR)
+        t(self.X_RSI, y, f"{rsi:.0f}", color=rsi_c, fontsize=12, fontweight='bold', ha='center', va='center')
+        
+        mfi_c = self.RED if mfi > 80 else (self.GREEN if mfi < 20 else self.TEXT_COLOR)
+        t(self.X_MFI, y, f"{mfi:.0f}", color=mfi_c, fontsize=12, fontweight='bold', ha='center', va='center')
+        
+        adx_c = self.SUB_TEXT_COLOR
+        if adx > 25: adx_c = self.YELLOW
+        if adx > 50: adx_c = self.BLUE
+        t(self.X_ADX, y, f"{adx:.0f}", color=adx_c, fontsize=12, fontweight='bold', ha='center', va='center')
+
+        # --- Visuals Calculation ---
+        sp_h = 0.5 * y_step
+        sp_y_bottom = y - (sp_h / 2) # Bottom of the visual element
+        
+        # 1. Liquidation Bars (Using Rectangles directly on main axis)
         liq_long = _safe_float(item.get('liq_1h_long', 0), 0.0)
         liq_short = _safe_float(item.get('liq_1h_short', 0), 0.0)
-
-        is_up = change >= 0
-        val_color = GREEN if is_up else RED
-
-        # 1. Text Columns
-        add_text(X_SYM, y, symbol, 'white', 12, 'bold', 'left')
-        add_text(X_TF, y, tf, SUB_TEXT_COLOR, 11, 'normal', 'left')
-        add_text(X_PRICE, y, f"${fmt_price_extended(price)}", 'white', 12, 'normal', 'right')
-        add_text(X_CHG, y, f"{change:+.2f}%", val_color, 12, 'normal', 'right')
-        add_text(X_VOL, y, fmt_large_num(usdt_vol), 'white', 11, 'normal', 'right')
-
-        # 2. Indicators
-        rsi_c = RED if rsi > 70 else (GREEN if rsi < 30 else TEXT_COLOR)
-        add_text(X_RSI, y, f"{rsi:.0f}", rsi_c, 12, 'bold', 'center')
-
-        mfi_c = RED if mfi > 80 else (GREEN if mfi < 20 else TEXT_COLOR)
-        add_text(X_MFI, y, f"{mfi:.0f}", mfi_c, 12, 'bold', 'center')
-
-        adx_c = SUB_TEXT_COLOR
-        if adx > 25:
-            adx_c = YELLOW
-        if adx > 50:
-            adx_c = BLUE
-        add_text(X_ADX, y, f"{adx:.0f}", adx_c, 12, 'bold', 'center')
-
-        sp_h = 0.5 * y_step
-        sp_y = y - (sp_h / 2)
-
-        # 3. Liquidation Bar Chart
         total_liq = liq_long + liq_short
+        
         if total_liq > 0:
-            ax_liq = fig.add_axes([X_LIQ, sp_y + 0.005, W_LIQ, sp_h * 0.4])
-            ax_liq.axis('off')
-            
-            # Normalize to 0-1
             long_pct = liq_long / total_liq
             short_pct = liq_short / total_liq
             
-            # Draw bars (Longs = RED because they sold, Shorts = GREEN because they bought)
-            ax_liq.barh([0], [long_pct], color=RED, height=0.8, left=0)
-            ax_liq.barh([0], [short_pct], color=GREEN, height=0.8, left=long_pct)
-            ax_liq.set_xlim(0, 1)
-
-            # Text label below bar
+            # Bar geometry
+            bar_x = self.X_LIQ
+            bar_y = sp_y_bottom + (0.005 / total_h) # slight offset
+            bar_w = self.W_LIQ
+            bar_h = sp_h * 0.4
+            
+            # Add Patches
+            if long_pct > 0:
+                self.ax.add_patch(Rectangle((bar_x, bar_y), bar_w * long_pct, bar_h, 
+                                            facecolor=self.RED, edgecolor=None))
+            if short_pct > 0:
+                self.ax.add_patch(Rectangle((bar_x + (bar_w * long_pct), bar_y), bar_w * short_pct, bar_h, 
+                                            facecolor=self.GREEN, edgecolor=None))
+            
             label_txt = f"L:{fmt_large_num(liq_long)} S:{fmt_large_num(liq_short)}"
-            add_text(X_LIQ + (W_LIQ/2), y - 0.015, label_txt, SUB_TEXT_COLOR, 8, 'normal', 'center')
+            t(self.X_LIQ + (self.W_LIQ/2), y - (0.015 / total_h), label_txt, 
+              color=self.SUB_TEXT_COLOR, fontsize=8, ha='center', va='top')
         else:
-            add_text(X_LIQ + (W_LIQ/2), y, "-", SUB_TEXT_COLOR, 11, 'normal', 'center')
+            t(self.X_LIQ + (self.W_LIQ/2), y, "-", color=self.SUB_TEXT_COLOR, fontsize=11, ha='center', va='center')
 
-
-        # Clean History
-        hist_clean = []
-        if isinstance(history, np.ndarray):
-            history = history.tolist()
-
-        if history:
-            for val in history[-20:]:
-                fval = _safe_float(val, None)
-                if fval is not None and fval > 0:
-                    hist_clean.append(fval)
-
-        # 4. Sparkline (Trend)
+        # 2. Sparklines (Direct Line Drawing)
+        history = item.get('history', [])
+        if isinstance(history, np.ndarray): history = history.tolist()
+        hist_clean = [float(x) for x in history[-20:] if _safe_float(x) is not None and x > 0]
+        
         if len(hist_clean) > 1:
-            ax_spark = fig.add_axes([X_SPARK, sp_y, W_SPARK, sp_h])
-            ax_spark.patch.set_alpha(0)  # Transparent background
-            ax_spark.axis('off')
+            h_arr = np.array(hist_clean)
+            h_min, h_max = h_arr.min(), h_arr.max()
+            h_range = h_max - h_min if h_max > h_min else 1.0
             
-            low_p = min(hist_clean)
-            line_color = GREEN if hist_clean[-1] >= hist_clean[0] else RED
+            # Normalize to 0-1
+            norm_h = (h_arr - h_min) / h_range
             
-            ax_spark.plot(hist_clean, color=line_color, lw=1.5)
-            ax_spark.fill_between(range(len(hist_clean)), hist_clean, low_p, color=line_color, alpha=0.1)
+            # Scale to Sparkline Box dimensions
+            # X coordinates
+            x_vals = np.linspace(self.X_SPARK, self.X_SPARK + self.W_SPARK, len(hist_clean))
+            # Y coordinates
+            y_vals = sp_y_bottom + (norm_h * sp_h)
+            
+            line_color = self.GREEN if hist_clean[-1] >= hist_clean[0] else self.RED
+            
+            # Add Line
+            self.ax.add_line(Line2D(x_vals, y_vals, color=line_color, lw=1.5))
+            
+            # Note: fill_between is hard to optimize with Line2D on shared axis without creating a complex PathPatch.
+            # Omitting transparency fill for pure speed. If critical, use PolyCollection, but Line2D is 10x faster.
 
-        # 5. Range Bar / Liquidity Range Bar
-        ax_range = fig.add_axes([X_RANGE, sp_y, W_RANGE, sp_h])
-        ax_range.patch.set_alpha(0)
-        ax_range.axis('off')
-        ax_range.set_xlim(0, 1)
-        ax_range.set_ylim(0, 1)
-
-        # Draw Base Line (Grey bar background)
-        ax_range.plot([0, 1], [0.5, 0.5], color=BAR_GREY, lw=2, zorder=1)
-        center = 0.5
+        # 3. Range Bar (Direct Drawing)
+        range_center_x = self.X_RANGE + (self.W_RANGE / 2)
+        range_y_center = y # vertically centered on row
+        range_w_half = self.W_RANGE / 2
+        
+        # Base Line
+        self.ax.add_line(Line2D([self.X_RANGE, self.X_RANGE + self.W_RANGE], 
+                                [range_y_center, range_y_center], 
+                                color=self.BAR_GREY, lw=2, zorder=1))
 
         if _depth_available(item):
-            # --- LIQUIDITY RANGE BAR ---
-            down_price = _safe_float(item.get("depth_down_price"), None)
-            up_price = _safe_float(item.get("depth_up_price"), None)
-            down_pct = _safe_float(item.get("depth_down_pct"), None)
-            up_pct = _safe_float(item.get("depth_up_pct"), None)
-
-            # Recalculate percent if missing but prices exist
-            if (down_pct is None or up_pct is None) and (down_price is not None and up_price is not None and price > 0):
-                down_pct = max(0.0, (price - down_price) / price * 100.0)
-                up_pct = max(0.0, (up_price - price) / price * 100.0)
-
-            down_pct = float(down_pct) if down_pct is not None else 0.0
-            up_pct = float(up_pct) if up_pct is not None else 0.0
-
-            # Scale and Clamp
-            down_len = min(max(down_pct, 0.0) / LIQ_MAX_PCT_DISPLAY, 1.0) * 0.5
-            up_len = min(max(up_pct, 0.0) / LIQ_MAX_PCT_DISPLAY, 1.0) * 0.5
-
-            # Draw Depth Bars (Red/Green extending from center)
-            if down_len > 0:
-                ax_range.plot([center - down_len, center], [0.5, 0.5], color=RED, lw=3, zorder=2)
-            if up_len > 0:
-                ax_range.plot([center, center + up_len], [0.5, 0.5], color=GREEN, lw=3, zorder=2)
-
-            # Center Dot (Current Price)
-            ax_range.scatter(
-                [center], [0.5],
-                color=MID_DOT, s=40, zorder=3,
-                edgecolors='black', linewidth=0.6,
-                clip_on=False
-            )
-
-            # Labels (Depth Prices)
-            if down_price is not None:
-                add_text(X_RANGE - 0.015, y, fmt_price_extended(down_price), SUB_TEXT_COLOR, 9, 'normal', 'right')
-            if up_price is not None:
-                add_text(X_RANGE + W_RANGE + 0.015, y, fmt_price_extended(up_price), SUB_TEXT_COLOR, 9, 'normal', 'left')
-
-        else:
-            # --- CANDLE RANGE BAR (Fallback) ---
-            if len(hist_clean) > 1:
-                curr_price = hist_clean[-1]
-                low_v = min(hist_clean)
-                high_v = max(hist_clean)
-                rng = high_v - low_v
-                
-                # Position of current price within the range (0.0 - 1.0)
-                pct = (curr_price - low_v) / rng if rng > 0 else 0.5
+            # Depth Logic
+            depth_down = _safe_float(item.get("depth_down_pct"), 0.0) or 0.0
+            depth_up = _safe_float(item.get("depth_up_pct"), 0.0) or 0.0
+            
+            # Scale 5% -> Full Width
+            LIQ_MAX_PCT = 5.0
+            down_len_norm = min(max(depth_down, 0.0) / LIQ_MAX_PCT, 1.0)
+            up_len_norm = min(max(depth_up, 0.0) / LIQ_MAX_PCT, 1.0)
+            
+            # Draw Red/Green Bars
+            if down_len_norm > 0:
+                x_start = range_center_x - (down_len_norm * range_w_half)
+                self.ax.add_line(Line2D([x_start, range_center_x], [range_y_center, range_y_center], 
+                                        color=self.RED, lw=3, zorder=2))
+            if up_len_norm > 0:
+                x_end = range_center_x + (up_len_norm * range_w_half)
+                self.ax.add_line(Line2D([range_center_x, x_end], [range_y_center, range_y_center], 
+                                        color=self.GREEN, lw=3, zorder=2))
+            
+            # Center Dot
+            self.ax.scatter([range_center_x], [range_y_center], color=self.MID_DOT, s=40, zorder=3, edgecolors='black', linewidth=0.6)
+            
+            # Labels
+            dp = item.get("depth_down_price")
+            up = item.get("depth_up_price")
+            if dp: t(self.X_RANGE - 0.005, y, fmt_price_extended(dp), color=self.SUB_TEXT_COLOR, fontsize=9, ha='right', va='center')
+            if up: t(self.X_RANGE + self.W_RANGE + 0.005, y, fmt_price_extended(up), color=self.SUB_TEXT_COLOR, fontsize=9, ha='left', va='center')
+            
+        elif len(hist_clean) > 1:
+            # Candle Range Fallback
+            curr = hist_clean[-1]
+            low_v, high_v = min(hist_clean), max(hist_clean)
+            rng = high_v - low_v
+            
+            if rng > 0:
+                pct = (curr - low_v) / rng
                 pct = max(0.0, min(1.0, pct))
-                dot_color = GREEN if pct > 0.5 else RED
+                dot_x = self.X_RANGE + (pct * self.W_RANGE)
+                dot_c = self.GREEN if pct > 0.5 else self.RED
+                
+                self.ax.scatter([dot_x], [range_y_center], color=dot_c, s=50, zorder=2, edgecolors='white', linewidth=1)
+                
+                t(self.X_RANGE - 0.005, y, fmt_price_extended(low_v), color=self.SUB_TEXT_COLOR, fontsize=9, ha='right', va='center')
+                t(self.X_RANGE + self.W_RANGE + 0.005, y, fmt_price_extended(high_v), color=self.SUB_TEXT_COLOR, fontsize=9, ha='left', va='center')
 
-                # Draw Dot
-                ax_range.scatter(
-                    [pct], [0.5],
-                    color=dot_color, s=50, zorder=2,
-                    edgecolors='white', linewidth=1,
-                    clip_on=False
-                )
+# ------------------------------------------------------------------------------
+# Global Instance (Singleton) for Performance
+# ------------------------------------------------------------------------------
+_generator = MarketImageGenerator()
 
-                # Labels (Low/High of candle history)
-                add_text(X_RANGE - 0.015, y, fmt_price_extended(low_v), SUB_TEXT_COLOR, 9, 'normal', 'right')
-                add_text(X_RANGE + W_RANGE + 0.015, y, fmt_price_extended(high_v), SUB_TEXT_COLOR, 9, 'normal', 'left')
-
-    # --- OUTPUT ---
-    buf = io.BytesIO()
-    try:
-        canvas.print_png(buf)
-        buf.seek(0)
-        return buf
-    except Exception:
-        logger.exception("Failed to render PNG image")
-        return None
-    finally:
-        # Crucial Memory Cleanup
-        try:
-            plt.close(fig)
-            fig.clf()
-            del canvas
-            del fig
-            gc.collect()
-        except Exception:
-            pass
+def generate_market_image(data_list):
+    """
+    Public API wrapper. Uses the persistent _generator instance to ensure speed.
+    """
+    return _generator.render(data_list)
