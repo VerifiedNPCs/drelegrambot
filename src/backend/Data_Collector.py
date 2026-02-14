@@ -13,11 +13,17 @@ from numba import njit, prange
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple, Set
 from collections import defaultdict 
-
+import zipfile
+import csv
+from io import BytesIO, StringIO
+from datetime import datetime, timedelta
 from config import config, setup_logging
 
 logger = setup_logging("DataCollector")
-
+STABLECOINS = {
+    'USDT', 'USDC', 'BUSD', 'TUSD', 'DAI', 'FDUSD', 
+    'USDD', 'USDP', 'FRAX', 'USDB', 'USDE'
+}
 # ==============================================================================
 # ⚡ NUMBA JIT ENGINE (Zero-Allocation Optimization)
 # ==============================================================================
@@ -148,7 +154,177 @@ def calc_indicators_inplace(
 # ==============================================================================
 # 💀 LIQUIDATION MONITOR (Full History & Stats)
 # ==============================================================================
+class LiquidationHistoryLoader:
+    def __init__(self, liq_monitor: 'LiquidationMonitor', symbols: List[str]):
+        self.liq_monitor = liq_monitor
+        self.symbols = set(s.upper() for s in symbols)
+        self.base_url = "https://data.binance.vision/data/futures/um/daily/liquidationSnapshot"
+        self.running = True
+        self.last_loaded_date = None
+         
+    
+    async def download_and_parse_day(self, session: aiohttp.ClientSession, date_str: str) -> int:
+        '''
+        Downloads a single day's liquidation file from Binance.
+        Returns number of liquidations loaded.
+        
+        URL format: https://data.binance.vision/data/futures/um/daily/liquidationSnapshot/BTCUSDT/BTCUSDT-liquidationSnapshot-2026-02-13.zip
+        '''
+        loaded_count = 0
+        
+        # Process each symbol individually (Binance stores per-symbol files)
+        for symbol in self.symbols:
+            try:
+                filename = f"{symbol}-liquidationSnapshot-{date_str}.zip"
+                url = f"{self.base_url}/{symbol}/{filename}"
 
+                async with session.get(url, timeout=30) as resp:
+                    if resp.status == 404:
+                        # Symbol might not have liquidations that day or doesn't exist
+                        continue
+
+                    if resp.status != 200:
+                        logger.warning(f"Failed to download {symbol} liq data for {date_str}: HTTP {resp.status}")
+                        continue
+
+                    # Download ZIP file
+                    zip_data = await resp.read()
+
+                    # Extract CSV from ZIP
+                    with zipfile.ZipFile(BytesIO(zip_data)) as z:
+                        csv_filename = f"{symbol}-liquidationSnapshot-{date_str}.csv"
+
+                        if csv_filename not in z.namelist():
+                            continue
+
+                        with z.open(csv_filename) as csvfile:
+                            csv_content = csvfile.read().decode('utf-8')
+                            reader = csv.DictReader(StringIO(csv_content))
+
+                            # Parse CSV rows
+                            # Expected columns: time,symbol,side,order_type,time_in_force,original_quantity,price,average_price,order_status,order_last_filled_quantity
+                            for row in reader:
+                                try:
+                                    ts = float(row['time']) / 1000.0  # Convert ms to seconds
+                                    sym = row['symbol']
+                                    side = row['side']  # BUY or SELL
+                                    qty = float(row['original_quantity'])
+                                    price = float(row['price'])
+
+                                    usd_val = qty * price
+
+                                    # Add to history (same format as WebSocket)    
+                                    with self.liq_monitor._lock:
+                                        self.liq_monitor.history.append((ts, sym, side, usd_val, price))
+
+                                    loaded_count += 1
+
+                                except (KeyError, ValueError, TypeError):
+                                    continue
+
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout downloading {symbol} liq data for {date_str}")
+            except Exception as e:
+                logger.debug(f"Error loading {symbol} liq for {date_str}: {e}")    
+
+        return loaded_count
+
+
+    async def load_last_7_days(self):
+        '''
+        Downloads last 7 days of liquidation history at startup.
+        '''
+        logger.info("💀 Loading 7-day liquidation history...")
+
+        today = datetime.utcnow()
+        total_loaded = 0
+
+        async with aiohttp.ClientSession() as session:
+            for days_ago in range(7, 0, -1):  # 7 days ago to yesterday
+                target_date = today - timedelta(days=days_ago)
+                date_str = target_date.strftime("%Y-%m-%d")
+
+                logger.info(f"📥 Downloading liquidations for {date_str}...")      
+                count = await self.download_and_parse_day(session, date_str)       
+                total_loaded += count
+
+                # Small delay to avoid rate limits
+                await asyncio.sleep(0.5)
+
+        # After loading, recalculate stats from scratch
+        await self.liq_monitor._cleanup_loop_once()
+
+        logger.info(f"✅ Loaded {total_loaded:,} historical liquidations (7 days)")
+
+        # Set last loaded date to yesterday
+        self.last_loaded_date = (today - timedelta(days=1)).strftime("%Y-%m-%d")   
+
+
+    async def daily_update_task(self):
+        '''
+        Checks daily at 00:05 UTC if new historical file is available.
+        Downloads it and merges with existing data.
+        '''
+        logger.info("💀 Daily liquidation update task started (checks at 00:05 UTC)")
+
+        while self.running:
+            try:
+                now = datetime.utcnow()
+
+                # Calculate seconds until next 00:05 UTC
+                tomorrow = now + timedelta(days=1)
+                next_check = tomorrow.replace(hour=0, minute=5, second=0, microsecond=0)
+
+                # If we're past 00:05 today, check today's file
+                today_check = now.replace(hour=0, minute=5, second=0, microsecond=0)
+                if now > today_check:
+                    next_check = today_check
+
+                # Calculate wait time
+                wait_seconds = (next_check - now).total_seconds()
+
+                if wait_seconds > 0:
+                    logger.debug(f"Next liq history update in {wait_seconds/3600:.1f} hours")
+                    await asyncio.sleep(min(wait_seconds, 3600))  # Check every hour max
+                    continue
+
+                # Time to check for new file
+                yesterday = now - timedelta(days=1)
+                date_str = yesterday.strftime("%Y-%m-%d")
+
+                # Skip if already loaded
+                if date_str == self.last_loaded_date:
+                    await asyncio.sleep(3600)  # Check again in 1 hour
+                    continue
+
+                logger.info(f"📥 Checking for new liquidation file: {date_str}")   
+
+                async with aiohttp.ClientSession() as session:
+                    count = await self.download_and_parse_day(session, date_str)   
+
+                if count > 0:
+                    logger.info(f"✅ Loaded {count:,} new liquidations from {date_str}")
+                    self.last_loaded_date = date_str
+
+                    # Trigger cleanup to recalculate windows
+                    await self.liq_monitor._cleanup_loop_once()
+                else:
+                    logger.info(f"No new liquidation data found for {date_str}")   
+
+                # Wait 1 hour before checking again
+                await asyncio.sleep(3600)
+
+            except Exception as e:
+                logger.error(f"Daily liq update error: {e}")
+                await asyncio.sleep(300)  # Retry in 5 min
+
+
+    async def start(self):
+        '''
+        Main entry point: Load history, then start daily updater.
+        '''
+        await self.load_last_7_days()
+        await self.daily_update_task()
 class LiquidationMonitor:
     def __init__(self):
         self.url = "wss://fstream.binance.com/ws/!forceOrder@arr"
@@ -192,6 +368,43 @@ class LiquidationMonitor:
             except Exception as e:
                 logger.error(f"Liq Stream Disconnected: {e}")
                 await asyncio.sleep(5)
+    async def _cleanup_loop_once(self):
+        '''
+        Manual trigger for cleanup (used by history loader).
+        Same logic as _cleanup_loop but runs once.
+        '''
+        now = time.time()
+        cutoff_24h = now - 86400
+        cutoff_1h = now - 3600
+
+        with self._lock:
+            # 1. Prune old history
+            while self.history and self.history[0][0] < cutoff_24h:
+                self.history.popleft()
+
+            # 2. Re-calculate ALL stats from scratch
+            new_stats = defaultdict(lambda: {
+                "1h_long": 0.0, "1h_short": 0.0,
+                "24h_long": 0.0, "24h_short": 0.0,
+                "last_price": 0.0
+            })
+
+            # Copy last prices from old stats
+            for sym, old_s in self.symbol_stats.items():
+                new_stats[sym]["last_price"] = old_s["last_price"]
+
+            for ts, sym, side, usd, price in self.history:
+                s = new_stats[sym]
+                if side == 'SELL':
+                    s["24h_long"] += usd
+                    if ts > cutoff_1h: s["1h_long"] += usd
+                else:
+                    s["24h_short"] += usd
+                    if ts > cutoff_1h: s["1h_short"] += usd
+
+            self.symbol_stats = new_stats
+
+        logger.debug(f"Liq stats recalculated: {len(self.history)} events in memory")
 
     def _process_event(self, data):
         """Parses a single websocket message."""
@@ -285,14 +498,17 @@ class MarketMatrix:
         self.n_symbols = len(symbols)
         self.max_candles = max_candles
         self.symbol_map = {sym: i for i, sym in enumerate(symbols)}
+        
 
-        # Arrays (Float32 for 50% memory saving)
+        # ===== EXISTING ARRAYS (keep as-is) =====
         self.closes = np.zeros((self.n_symbols, max_candles), dtype=np.float32)
         self.volumes = np.zeros((self.n_symbols, max_candles), dtype=np.float32)
         self.highs = np.zeros((self.n_symbols, max_candles), dtype=np.float32)
         self.lows = np.zeros((self.n_symbols, max_candles), dtype=np.float32)
         self.timestamps = np.zeros((self.n_symbols, max_candles), dtype=np.uint64)
         self.last_update_ts = np.zeros(self.n_symbols, dtype=np.uint64)
+        self.liquidity_bid_5pct = np.zeros(self.n_symbols, dtype=np.float32)
+        self.liquidity_ask_5pct = np.zeros(self.n_symbols, dtype=np.float32)
 
         # Indicator Buffers (Pre-allocated)
         self.rsi = np.full(self.n_symbols, 50.0, dtype=np.float32)
@@ -300,7 +516,96 @@ class MarketMatrix:
         self.adx = np.zeros(self.n_symbols, dtype=np.float32)
         self.vol_z = np.zeros(self.n_symbols, dtype=np.float32)
 
+        # ===== NEW: FUTURES DATA ARRAYS =====
+        # Funding Rate (updated every 8 hours)
+        self.funding_rate = np.zeros(self.n_symbols, dtype=np.float32)
+        self.next_funding_time = np.zeros(self.n_symbols, dtype=np.uint64)
+        
+        # Open Interest (USD value)
+        self.open_interest = np.zeros(self.n_symbols, dtype=np.float32)
+
+        # Long/Short Ratios
+        self.long_short_ratio_accounts = np.zeros(self.n_symbols, dtype=np.float32)  # Top accounts
+        self.long_short_ratio_positions = np.zeros(self.n_symbols, dtype=np.float32)  # Top positions
+        self.long_short_ratio_global = np.zeros(self.n_symbols, dtype=np.float32)  # All traders
+
+        # Taker Buy/Sell Volume Ratio
+        self.taker_buy_sell_ratio = np.zeros(self.n_symbols, dtype=np.float32)
+
+        # Mark Price & Index Price
+        self.mark_price = np.zeros(self.n_symbols, dtype=np.float32)
+        self.index_price = np.zeros(self.n_symbols, dtype=np.float32)
+
+        # Premium Index (Mark Price - Index Price) / Index Price 
+        self.premium_index = np.zeros(self.n_symbols, dtype=np.float32)
+
+        # 24h Stats
+        self.price_change_24h = np.zeros(self.n_symbols, dtype=np.float32)  # % change
+        self.volume_24h = np.zeros(self.n_symbols, dtype=np.float32)  # USD volume
+        self.turnover_24h = np.zeros(self.n_symbols, dtype=np.float32)  # Quote asset volume
+
         self.lock = threading.Lock()
+
+
+    # ADD this helper method to update futures data
+    def update_futures_data(self, symbol: str, data_type: str, value: float, extra_data: dict = None):
+        '''
+        Thread-safe update for futures metrics.
+
+        data_type can be: 'funding_rate', 'open_interest', 'long_short_accounts',
+                         'volume_24h', 'turnover_24h'
+                         'volume_24h', 'turnover_24h'
+                         'volume_24h', 'turnover_24h'
+        '''
+        idx = self.symbol_map.get(symbol)
+        if idx is None:
+            return
+
+        with self.lock:
+            if data_type == 'funding_rate':
+                self.funding_rate[idx] = value
+                if extra_data and 'next_funding_time' in extra_data:
+                    self.next_funding_time[idx] = np.uint64(extra_data['next_funding_time'])
+
+            elif data_type == 'open_interest':
+                self.open_interest[idx] = value
+
+            elif data_type == 'long_short_accounts':
+                self.long_short_ratio_accounts[idx] = value
+
+            elif data_type == 'long_short_positions':
+                self.long_short_ratio_positions[idx] = value
+
+            elif data_type == 'long_short_global':
+                self.long_short_ratio_global[idx] = value
+
+            elif data_type == 'taker_ratio':
+                self.taker_buy_sell_ratio[idx] = value
+
+            elif data_type == 'mark_price':
+                self.mark_price[idx] = value
+
+            elif data_type == 'index_price':
+                self.index_price[idx] = value
+
+            elif data_type == 'premium_index':
+                self.premium_index[idx] = value
+
+            elif data_type == 'price_change_24h':
+                self.price_change_24h[idx] = value
+
+            elif data_type == 'volume_24h':
+                self.volume_24h[idx] = value
+
+            elif data_type == 'turnover_24h':
+                self.turnover_24h[idx] = value
+                
+            elif data_type == 'liquidity_5pct':
+                # value is bid_liquidity, extra_data is {'ask': ask_liquidity}
+                self.liquidity_bid_5pct[idx] = value
+                if extra_data and 'ask' in extra_data:
+                    self.liquidity_ask_5pct[idx] = float(extra_data['ask'])
+
 
     def update_candle(self, symbol, close, volume, high, low, ts_ms: int, is_closed: bool):
         idx = self.symbol_map.get(symbol)
@@ -332,7 +637,7 @@ class MarketMatrix:
                 self.lows[idx, pos] = low
 
     def get_analysis(self):
-        """Returns a DICT of all analysis for the bot to read instantly."""
+        """Returns a DICT of all analysis including futures data for the bot to read instantly."""
         results = {}
         with self.lock:
             # Shallow copies of result arrays (fast)
@@ -342,7 +647,23 @@ class MarketMatrix:
             vol_z_copy = self.vol_z
             closes_copy = self.closes
             volumes_copy = self.volumes
-            
+
+            # Futures data copies
+            funding_rate_copy = self.funding_rate
+            open_interest_copy = self.open_interest
+            long_short_accounts_copy = self.long_short_ratio_accounts
+            long_short_positions_copy = self.long_short_ratio_positions
+            long_short_global_copy = self.long_short_ratio_global
+            taker_ratio_copy = self.taker_buy_sell_ratio
+            mark_price_copy = self.mark_price
+            index_price_copy = self.index_price
+            premium_index_copy = self.premium_index
+            price_change_24h_copy = self.price_change_24h
+            volume_24h_copy = self.volume_24h
+            turnover_24h_copy = self.turnover_24h
+            bid_liq_copy = self.liquidity_bid_5pct
+            ask_liq_copy = self.liquidity_ask_5pct
+
             # Iterate efficiently
             for sym, i in self.symbol_map.items():
                 price = float(closes_copy[i, -1])
@@ -350,6 +671,7 @@ class MarketMatrix:
                 change = ((price - prev) / prev) * 100 if prev > 0 else 0.0
 
                 results[sym] = {
+                    # Spot data
                     'price': price,
                     'volume': float(volumes_copy[i, -1]),
                     'change_tf': change,
@@ -357,6 +679,22 @@ class MarketMatrix:
                     'mfi': float(mfi_copy[i]),
                     'adx': float(adx_copy[i]),
                     'vol_z': float(vol_z_copy[i]),
+
+                    # Futures data
+                    'funding_rate': float(funding_rate_copy[i]),
+                    'open_interest': float(open_interest_copy[i]),
+                    'long_short_accounts': float(long_short_accounts_copy[i]),
+                    'long_short_positions': float(long_short_positions_copy[i]),
+                    'long_short_global': float(long_short_global_copy[i]),
+                    'taker_buy_sell_ratio': float(taker_ratio_copy[i]),
+                    'mark_price': float(mark_price_copy[i]),
+                    'index_price': float(index_price_copy[i]),
+                    'premium_index': float(premium_index_copy[i]),
+                    'price_change_24h': float(price_change_24h_copy[i]),
+                    'volume_24h': float(volume_24h_copy[i]),
+                    'turnover_24h': float(turnover_24h_copy[i]),
+                    'liquidity_bid_5pct': float(bid_liq_copy[i]),
+                    'liquidity_ask_5pct': float(ask_liq_copy[i]),
                 }
         return results
 
@@ -404,112 +742,448 @@ class _DepthBook:
         asks = sorted(self.asks.items(), key=lambda x: x[0])[: self.max_levels]
         return bids, asks
 
-class FuturesDepthManager:
-    def __init__(self, levels=20, speed="100ms"):
-        self.levels = levels
-        self.speed = speed
-        self._desired = set()
-        self._desired_lock = asyncio.Lock()
-        self._books = {}
-        self._books_lock = threading.Lock()
+class FuturesDataCollector:
+    """
+    Collects ALL available futures data from Binance:
+    - Funding Rate (REST + WebSocket)
+    - Open Interest (REST + WebSocket)
+    - Long/Short Ratios (REST)
+    - Taker Buy/Sell Volume (REST)
+    - Mark Price, Index Price (WebSocket)
+    - Premium Index (WebSocket)
+    - 24h Ticker Stats (WebSocket)
+    """
+
+    def __init__(self, symbols: List[str], matrices: Dict[str, MarketMatrix]):
+        self.symbols = [s.upper() for s in symbols]
+        self.matrices = matrices  # Reference to all timeframe matrices
         self.running = True
-        self._reconnect_event = asyncio.Event()
+        self.fapi_base = "https://fapi.binance.com/fapi/v1"
+        self.fapi_ws = "wss://fstream.binance.com/ws"
 
-    async def set_watchlist(self, symbols: List[str]):
-        syms = set(s.upper() for s in symbols if s)
-        async with self._desired_lock:
-            if syms != self._desired:
-                self._desired = syms
-                self._reconnect_event.set()
-                self._cleanup_unused(syms)
 
-    def _cleanup_unused(self, active_symbols: Set[str]):
-        with self._books_lock:
-            for k in list(self._books.keys()):
-                if k not in active_symbols: del self._books[k]
-
-    def _ensure_book(self, symbol: str) -> _DepthBook:
-        with self._books_lock:
-            if symbol not in self._books:
-                self._books[symbol] = _DepthBook(self.levels)
-            return self._books[symbol]
-
-    async def _rest_snapshot(self, session, symbol):
+    async def fetch_funding_rates(self):
+        """
+        Fetches current funding rates for all symbols.
+        Updated every 10 minutes (funding happens every 8 hours).
+        """
         try:
-            url = "https://fapi.binance.com/fapi/v1/depth"
-            async with session.get(url, params={"symbol": symbol, "limit": 50}, timeout=5) as resp:
+            url = f"{self.fapi_base}/premiumIndex"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status != 200:
+                        return
+
+                    data = await resp.json()
+
+                    for item in data:
+                        symbol = item.get('symbol')
+                        if symbol not in self.symbols:
+                            continue
+
+                        funding_rate = float(item.get('lastFundingRate', 0)) * 100  # Convert to %      
+                        next_funding = int(item.get('nextFundingTime', 0))
+                        mark_price = float(item.get('markPrice', 0))
+                        index_price = float(item.get('indexPrice', 0))
+
+                        # Calculate premium index
+                        if index_price > 0:
+                            premium = ((mark_price - index_price) / index_price) * 100
+                        else:
+                            premium = 0.0
+
+                        # Update all timeframe matrices
+                        for matrix in self.matrices.values():
+                            matrix.update_futures_data(symbol, 'funding_rate', funding_rate,
+                                                     {'next_funding_time': next_funding})
+                            matrix.update_futures_data(symbol, 'mark_price', mark_price)
+                            matrix.update_futures_data(symbol, 'index_price', index_price)
+                            matrix.update_futures_data(symbol, 'premium_index', premium)
+
+                    logger.debug(f"Updated funding rates for {len(data)} symbols")
+
+        except Exception as e:
+            logger.error(f"Funding rate fetch error: {e}")
+
+
+    async def fetch_open_interest(self):
+        """
+        Fetches open interest for all symbols.
+        Updated every 30 seconds.
+        """
+        try:
+            url = f"{self.fapi_base}/openInterest"
+
+            async with aiohttp.ClientSession() as session:
+                tasks = []
+                for symbol in self.symbols:
+                    tasks.append(self._fetch_single_oi(session, symbol))
+
+                await asyncio.gather(*tasks)
+
+        except Exception as e:
+            logger.error(f"Open interest fetch error: {e}")
+
+
+    async def _fetch_single_oi(self, session, symbol):
+        """Helper to fetch OI for a single symbol."""
+        try:
+            url = f"{self.fapi_base}/openInterest"
+            async with session.get(url, params={"symbol": symbol}, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    book = self._ensure_book(symbol)
-                    book.seed_from_snapshot(data.get("bids", []), data.get("asks", []))
-        except Exception: pass 
+                    oi_value = float(data.get('openInterest', 0))
 
-    def compute_liquidity_range(self, symbol, target_usdt, mid_price=None):
-        with self._books_lock:
-            book = self._books.get(symbol.upper())
-            if not book: return None
-            book.touch()
-            bids, asks = book.top_levels()
-            ts = book.last_event_ms
+                    # Update all matrices
+                    for matrix in self.matrices.values():
+                        matrix.update_futures_data(symbol, 'open_interest', oi_value)
+        except:
+            pass
 
-        if not bids or not asks: return None
-        best_bid = bids[0][0]; best_ask = asks[0][0]
-        mid = float(mid_price) if (mid_price and mid_price > 0) else (best_bid + best_ask) / 2.0
-        
-        cum = 0.0; down_price = bids[-1][0]
-        for p, q in bids:
-            cum += p * q
-            down_price = p
-            if cum >= target_usdt: break
-        
-        cum = 0.0; up_price = asks[-1][0]
-        for p, q in asks:
-            cum += p * q
-            up_price = p
-            if cum >= target_usdt: break
-            
-        down_pct = max(0.0, (mid - down_price) / mid * 100.0)
-        up_pct = max(0.0, (up_price - mid) / mid * 100.0)
 
-        return {
-            "mid": mid, "down_price": down_price, "up_price": up_price,
-            "down_pct": down_pct, "up_pct": up_pct, "book_ts_ms": ts
-        }
+    async def fetch_long_short_ratio(self):
+        """
+        Fetches long/short ratios from 3 sources:
+        - Top Trader Accounts
+        - Top Trader Positions
+        - Global (All Accounts)
 
-    async def run(self):
+        Updated every 5 minutes.
+        """
+        try:
+            period = "5m"  # 5-minute window
+            limit = 1  # Only need latest
+
+            async with aiohttp.ClientSession() as session:
+                for symbol in self.symbols:
+                    try:
+                        # 1. Top Trader Long/Short Ratio (Accounts)
+                        url1 = f"{self.fapi_base}/topLongShortAccountRatio"
+                        async with session.get(url1, params={"symbol": symbol, "period": period, "limit": limit}, timeout=5) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                if data:
+                                    ratio = float(data[0].get('longShortRatio', 1.0))
+                                    for matrix in self.matrices.values():
+                                        matrix.update_futures_data(symbol, 'long_short_accounts', ratio)
+
+                        # 2. Top Trader Long/Short Ratio (Positions)
+                        url2 = f"{self.fapi_base}/topLongShortPositionRatio"
+                        async with session.get(url2, params={"symbol": symbol, "period": period, "limit": limit}, timeout=5) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                if data:
+                                    ratio = float(data[0].get('longShortRatio', 1.0))
+                                    for matrix in self.matrices.values():
+                                        matrix.update_futures_data(symbol, 'long_short_positions', ratio)
+
+                        # 3. Global Long/Short Ratio (All Accounts)
+                        url3 = f"{self.fapi_base}/globalLongShortAccountRatio"
+                        async with session.get(url3, params={"symbol": symbol, "period": period, "limit": limit}, timeout=5) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                if data:
+                                    ratio = float(data[0].get('longShortRatio', 1.0))
+                                    for matrix in self.matrices.values():
+                                        matrix.update_futures_data(symbol, 'long_short_global', ratio)  
+
+                        # Small delay to avoid rate limits
+                        await asyncio.sleep(0.1)
+
+                    except Exception:
+                        continue
+
+        except Exception as e:
+            logger.error(f"Long/short ratio fetch error: {e}")
+
+
+    async def fetch_taker_buysell_volume(self):
+        """
+        Fetches taker buy/sell volume ratio.
+        Higher ratio = more aggressive buying.
+        Updated every 5 minutes.
+        """
+        try:
+            period = "5m"
+            limit = 1
+
+            async with aiohttp.ClientSession() as session:
+                for symbol in self.symbols:
+                    try:
+                        url = f"{self.fapi_base}/takerlongshortRatio"
+                        async with session.get(url, params={"symbol": symbol, "period": period, "limit": limit}, timeout=5) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                if data:
+                                    buy_vol = float(data[0].get('buySellRatio', 1.0))
+                                    for matrix in self.matrices.values():
+                                        matrix.update_futures_data(symbol, 'taker_ratio', buy_vol)      
+
+                        await asyncio.sleep(0.1)
+                    except:
+                        continue
+
+        except Exception as e:
+            logger.error(f"Taker volume fetch error: {e}")
+
+
+
+    async def websocket_24h_ticker(self):
+        """
+        WebSocket stream for 24h ticker statistics (ALL symbols in 1 stream).
+        Provides real-time price change, volume, turnover.
+        """
+        url = f"{self.fapi_ws}/!ticker@arr"  # ← OPTIMIZED: Single aggregate stream
+
+        backoff = 1.0
         while self.running:
             try:
-                self._reconnect_event.clear()
-                async with self._desired_lock:
-                    symbols = sorted(list(self._desired))
-                
-                if not symbols:
-                    await asyncio.sleep(1)
-                    continue
-
-                streams = [f"{s.lower()}@depth{self.levels}@{self.speed}" for s in symbols]
-                url = "wss://fstream.binance.com/stream?streams=" + "/".join(streams)
-
                 async with aiohttp.ClientSession() as session:
-                    await asyncio.gather(*[self._rest_snapshot(session, s) for s in symbols])
-                    async with session.ws_connect(url, heartbeat=30) as ws:
-                        logger.info(f"DepthManager: Connected {len(symbols)} syms")
-                        while self.running:
-                            if self._reconnect_event.is_set(): break
-                            try:
-                                msg = await ws.receive(timeout=10)
-                                if msg.type == aiohttp.WSMsgType.TEXT:
+                    async with session.ws_connect(url, heartbeat=20) as ws:
+                        logger.info("📊 Futures 24h Ticker Stream Connected (Aggregate)")
+                        backoff = 1.0
+
+                        async for msg in ws:
+                            if not self.running:
+                                break
+
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
                                     data = json.loads(msg.data)
-                                    payload = data.get("data", {})
-                                    if payload.get("e") == "depthUpdate":
-                                        s = payload.get("s")
-                                        if s: self._ensure_book(s).apply_updates(
-                                            payload.get("b", []), payload.get("a", []), payload.get("E", 0))
-                                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
-                            except asyncio.TimeoutError: continue
+
+                                    # Data is now an ARRAY of tickers
+                                    if isinstance(data, list):
+                                        for ticker in data:
+                                            symbol = ticker.get('s')
+
+                                            # Filter only our symbols
+                                            if symbol not in self.symbols:
+                                                continue
+
+                                            price_change_pct = float(ticker.get('P', 0))
+                                            volume = float(ticker.get('v', 0))
+                                            quote_volume = float(ticker.get('q', 0))
+
+                                            for matrix in self.matrices.values():
+                                                matrix.update_futures_data(symbol, 'price_change_24h', price_change_pct)
+                                                matrix.update_futures_data(symbol, 'volume_24h', volume)   
+                                                matrix.update_futures_data(symbol, 'turnover_24h', quote_volume)
+
+                                except:
+                                    pass
+
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+
             except Exception as e:
-                logger.error(f"DepthManager Error: {e}")
-                await asyncio.sleep(5)
+                logger.error(f"24h Ticker WS error: {e}")
+                await asyncio.sleep(min(backoff, 60))
+                backoff *= 1.5
+
+
+    async def websocket_mark_price(self):
+        """
+        WebSocket stream for mark price updates (ALL symbols in 1 stream).
+        Updates every 3 seconds.
+        """
+        url = f"{self.fapi_ws}/!markPrice@arr@1s"  # ← OPTIMIZED: Single aggregate stream
+
+        backoff = 1.0
+        while self.running:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(url, heartbeat=20) as ws:
+                        logger.info("📊 Futures Mark Price Stream Connected (Aggregate)")
+                        backoff = 1.0
+
+                        async for msg in ws:
+                            if not self.running:
+                                break
+
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+
+                                    # Data is now an ARRAY of mark prices
+                                    if isinstance(data, list):
+                                        for item in data:
+                                            symbol = item.get('s')
+
+                                            # Filter only our symbols
+                                            if symbol not in self.symbols:
+                                                continue
+
+                                            mark_price = float(item.get('p', 0))
+                                            index_price = float(item.get('i', 0))
+                                            funding_rate = float(item.get('r', 0)) * 100
+                                            next_funding = int(item.get('T', 0))
+
+                                            # Calculate premium
+                                            if index_price > 0:
+                                                premium = ((mark_price - index_price) / index_price) * 100 
+                                            else:
+                                                premium = 0.0
+
+                                            for matrix in self.matrices.values():
+                                                matrix.update_futures_data(symbol, 'mark_price', mark_price)
+                                                matrix.update_futures_data(symbol, 'index_price', index_price)
+                                                matrix.update_futures_data(symbol, 'premium_index', premium)
+                                                matrix.update_futures_data(symbol, 'funding_rate', funding_rate,
+                                                                         {'next_funding_time': next_funding})
+
+                                except:
+                                    pass
+
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+
+            except Exception as e:
+                logger.error(f"Mark Price WS error: {e}")
+                await asyncio.sleep(min(backoff, 60))
+                backoff *= 1.5
+
+
+
+    async def periodic_rest_updates(self):
+        """
+        Periodic REST API calls for data that doesn't have WebSocket streams.
+        """
+        logger.info("📊 Futures REST updater started")
+
+        while self.running:
+            try:
+                # Fetch all REST-only data
+                await self.fetch_open_interest()
+                await asyncio.sleep(30)  # 30s interval
+
+                await self.fetch_long_short_ratio()
+                await asyncio.sleep(300)  # 5 min interval
+
+                await self.fetch_taker_buysell_volume()
+                await asyncio.sleep(300)  # 5 min interval
+
+            except Exception as e:
+                logger.error(f"REST update error: {e}")
+                await asyncio.sleep(60)
+
+
+    async def run(self):
+        """
+        Main entry point - starts all data collection tasks.
+        """
+        logger.info("📊 Futures Data Collector Starting...")
+
+        # Initial fetch
+        await self.fetch_funding_rates()
+        await self.fetch_open_interest()
+
+        # Start all tasks
+        tasks = [
+            asyncio.create_task(self.websocket_24h_ticker()),
+            asyncio.create_task(self.websocket_mark_price()),
+            asyncio.create_task(self.periodic_rest_updates()),
+        ]
+
+        await asyncio.gather(*tasks)
+class DepthLiquidityCollector:
+    """
+    Calculates total liquidity (USDT value) within ±5% of mid price.
+    Uses periodic REST snapshots (limit=1000) to ensure full depth coverage.
+    Updates each symbol approx once per minute to respect weight limits.
+    """
+
+    def __init__(self, symbols: List[str], matrices: Dict[str, MarketMatrix]):
+        self.symbols = [s.upper() for s in symbols]
+        self.matrices = matrices
+        self.running = True
+        self.fapi_base = "https://fapi.binance.com/fapi/v1"
+        self.rate_limit_weight = 10  # Weight for limit=1000
+        self.max_weight_per_min = 2400
+
+        # Calculate safe delay between requests
+        # Target: 150 symbols * 10 weight = 1500 weight/min (Safe)
+        # 60 seconds / 150 symbols = 0.4s delay
+        self.request_delay = 60.0 / max(len(self.symbols), 1)
+
+
+    async def fetch_and_calculate_depth(self, session, symbol):
+        """
+        Fetches full depth (limit=1000) and sums liquidity within ±5%.
+        """
+        try:
+            url = f"{self.fapi_base}/depth"
+            params = {"symbol": symbol, "limit": 1000}
+
+            async with session.get(url, params=params, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    bids = data.get('bids', [])
+                    asks = data.get('asks', [])
+
+                    if not bids or not asks:
+                        return
+
+                    # Calculate Mid Price
+                    best_bid = float(bids[0][0])
+                    best_ask = float(asks[0][0])
+                    mid_price = (best_bid + best_ask) / 2.0
+
+                    lower_bound = mid_price * 0.95
+                    upper_bound = mid_price * 1.05
+
+                    # Sum Bids (Buy Liquidity) down to -5%
+                    bid_liquidity = 0.0
+                    for p_str, q_str in bids:
+                        price = float(p_str)
+                        if price < lower_bound:
+                            break  # Out of range
+                        qty = float(q_str)
+                        bid_liquidity += price * qty
+
+                    # Sum Asks (Sell Liquidity) up to +5%
+                    ask_liquidity = 0.0
+                    for p_str, q_str in asks:
+                        price = float(p_str)
+                        if price > upper_bound:
+                            break  # Out of range
+                        qty = float(q_str)
+                        ask_liquidity += price * qty
+
+                    # Update Matrices
+                    for matrix in self.matrices.values():
+                        matrix.update_futures_data(symbol, 'liquidity_5pct', bid_liquidity, {'ask': ask_liquidity})
+
+                elif resp.status == 429:
+                    logger.warning(f"DepthCollector: Rate limit hit (429). slowing down...")
+                    await asyncio.sleep(5)
+
+        except Exception as e:
+            # logger.debug(f"Depth calc error for {symbol}: {e}")
+            pass
+
+
+    async def run(self):
+        """
+        Main loop: Rotates through symbols and fetches snapshots.
+        """
+        logger.info(f"💧 Depth Liquidity Collector Started ({len(self.symbols)} symbols, ~60s cycle)")  
+
+        while self.running:
+            # Create session for the batch
+            async with aiohttp.ClientSession() as session:
+                for symbol in self.symbols:
+                    if not self.running: break
+
+                    # Fire and forget (or await if strict timing needed)
+                    # We await to enforce strict rate limiting pacing
+                    await self.fetch_and_calculate_depth(session, symbol)
+
+                    await asyncio.sleep(self.request_delay)
+
+            # Recalculate delay in case symbol count changed
+            if self.symbols:
+                self.request_delay = 60.0 / max(len(self.symbols), 1)
+
 
 # ==============================================================================
 # 📡 DATA COLLECTOR (Full Logic)
@@ -518,52 +1192,117 @@ class FuturesDepthManager:
 class BinanceMarketDataCollector:
     def __init__(self):
         self.api_url = "https://api.binance.com/api/v3"
-        self.spot_ws_base = "wss://stream.binance.com:9443"
+        self.spot_ws_base = "wss://fstream.binance.com"
         self.top_coins = []
         self.matrices = {}
-        self.active_timeframes = ['1m', '5m', '15m', '1h', '2h', '4h', '1d', '3d', '1w', '1M']
+        self.active_timeframes = ['1m', '5m', '15m', '1h', '4h', '1d']
         self.running = True
         self.executor = ThreadPoolExecutor(max_workers=4)
         self.output_dir = "./data_storage"
+        self.depth_liquidity_collector = None
+
         os.makedirs(self.output_dir, exist_ok=True)
-        self.futures_depth = FuturesDepthManager()
         self.liq_monitor = LiquidationMonitor()
-    async def set_depth_watchlist(self, symbols: List[str]):
-        await self.futures_depth.set_watchlist(symbols)
+        self.liq_history_loader = None
+        self.futures_collector = None  
 
     def get_depth_liquidity_range(
         self,
         symbol: str,
-        target_usdt: float,
-        mid_price: Optional[float] = None  # <--- THIS WAS MISSING
+        target_usdt: float = 0,  # Unused now, kept for compatibility
+        mid_price: Optional[float] = None
     ) -> Optional[Dict[str, float]]:
         """
-        Synchronous read accessor (safe) used by telegram_bot to enrich img_data.
+        Accessor for Telegram Bot to get ±5% liquidity.
+        Reads directly from MarketMatrix (Thread-Safe).
         """
-        # Pass the arguments through to the futures_depth manager
-        return self.futures_depth.compute_liquidity_range(
-            symbol, 
-            target_usdt, 
-            mid_price=mid_price
-        )
+        # 1. Get the 1m matrix (contains latest data)
+        matrix = self.matrices.get('1m')
+        if not matrix:
+            return None
+            
+        # 2. Find symbol index
+        idx = matrix.symbol_map.get(symbol)
+        if idx is None:
+            return None
+            
+        # 3. Read values safely
+        with matrix.lock:
+            bid_liq = float(matrix.liquidity_bid_5pct[idx])
+            ask_liq = float(matrix.liquidity_ask_5pct[idx])
+            price = float(matrix.closes[idx, -1])
+            
+        # 4. Return formatted dict
+        return {
+            "symbol": symbol,
+            "mid_price": price,
+            "bid_liquidity_5pct": bid_liq,
+            "ask_liquidity_5pct": ask_liq,
+            "total_liquidity_5pct": bid_liq + ask_liq
+        }
+    
     def get_liq_stats(self, symbol: str) -> dict:
         """Accessor for Telegram Bot to get liquidation stats."""
         return self.liq_monitor.get_liquidation_data(symbol)
     
-    async def get_top_100_coins(self):
+    async def fetch_top_coins(self):
+        """
+        Fetches top 100 coins by 24h volume (USDT pairs only).
+        Excludes stablecoins from base assets.
+        """
         url = f"{self.api_url}/ticker/24hr"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=10) as r:
                     data = await r.json()
-                    usdt = [x for x in data if x.get('symbol', '').endswith('USDT')]
-                    usdt.sort(key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)
-                    self.top_coins = [x['symbol'] for x in usdt[:100]]
-                    logger.info(f"Loaded {len(self.top_coins)} Top Coins.")
-        except Exception:
-            logger.exception("Failed to fetch top coins")
-            self.top_coins = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+
+                    # Filter: Must end with USDT AND base asset NOT a stablecoin
+                    usdt_pairs = []
+                    for ticker in data:
+                        symbol = ticker.get('symbol', '')
+
+                        # Check if ends with USDT
+                        if not symbol.endswith('USDT'):
+                            continue
+
+                        # Extract base asset (e.g., BTC from BTCUSDT)
+                        base_asset = symbol[:-4]  # Remove 'USDT'
+
+                        # Skip if base is a stablecoin
+                        if base_asset in STABLECOINS:
+                            continue
+
+                        usdt_pairs.append(ticker)
+
+                    # Sort by 24h quote volume (USDT volume)
+                    usdt_pairs.sort(key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)
+
+                    # Take top 100
+                    new_top_coins = [x['symbol'] for x in usdt_pairs[:165]]        
+
+                    # Log changes if list updated
+                    if self.top_coins:
+                        old_set = set(self.top_coins)
+                        new_set = set(new_top_coins)
+                        added = new_set - old_set
+                        removed = old_set - new_set
+
+                        if added:
+                            logger.info(f"➕ Added symbols: {', '.join(sorted(added)[:5])}..." if len(added) > 5 else f"➕ Added: {', '.join(sorted(added))}")        
+                        if removed:
+                            logger.info(f"➖ Removed symbols: {', '.join(sorted(removed)[:5])}..." if len(removed) > 5 else f"➖ Removed: {', '.join(sorted(removed))}")
+
+                    self.top_coins = new_top_coins
+                    logger.info(f"✔ Loaded {len(self.top_coins)} Top Coins (Stablecoins excluded)")
+
+        except Exception as e:
+            logger.exception(f"Failed to fetch top coins: {e}")
+            # Fallback to safe defaults if first run
+            if not self.top_coins:
+                self.top_coins = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+
         return self.top_coins
+
 
     async def load_state(self):
         """Restores state from disk."""
@@ -594,6 +1333,78 @@ class BinanceMarketDataCollector:
             logger.error("Could not load state from disk")
         return loaded
 
+
+    async def _rebuild_matrices_for_new_symbols(self):
+        """
+        Called when symbol list changes.
+        Preserves data for existing symbols, adds new ones.
+        """
+        for tf in self.active_timeframes:
+            if tf not in self.matrices:
+                # First time - create new matrix
+                self.matrices[tf] = MarketMatrix(self.top_coins, tf)
+                continue
+
+            old_matrix = self.matrices[tf]
+            old_symbols = old_matrix.symbols
+
+            # Check if symbols changed
+            if set(old_symbols) == set(self.top_coins):
+                continue  # No change needed
+
+            # Create new matrix with updated symbols
+            new_matrix = MarketMatrix(self.top_coins, tf, old_matrix.max_candles)  
+
+            # Copy data for symbols that exist in both old and new
+            for new_idx, symbol in enumerate(self.top_coins):
+                if symbol in old_matrix.symbol_map:
+                    old_idx = old_matrix.symbol_map[symbol]
+
+                    with old_matrix.lock:
+                        new_matrix.closes[new_idx] = old_matrix.closes[old_idx].copy()
+                        new_matrix.volumes[new_idx] = old_matrix.volumes[old_idx].copy()
+                        new_matrix.highs[new_idx] = old_matrix.highs[old_idx].copy()
+                        new_matrix.lows[new_idx] = old_matrix.lows[old_idx].copy() 
+                        new_matrix.timestamps[new_idx] = old_matrix.timestamps[old_idx].copy()
+
+            # Replace old matrix
+            self.matrices[tf] = new_matrix
+            logger.info(f"🔄 Rebuilt matrix for {tf}")
+
+
+    async def symbol_refresh_task(self):
+        """
+        Refreshes top 100 list every hour.
+        Updates matrices and depth watchlists automatically.
+        """
+        logger.info("🔄 Symbol Auto-Refresh Task Started (runs every 1 hour)")     
+
+        while self.running:
+            await asyncio.sleep(3600)  # 1 hour
+
+            try:
+                old_symbols = set(self.top_coins) if self.top_coins else set()     
+
+                # Fetch new top 100
+                await self.top_coins()
+
+                new_symbols = set(self.top_coins)
+
+                # If changed, rebuild
+                if old_symbols != new_symbols:
+                    logger.info("📊 Symbol list changed - rebuilding matrices...") 
+                    await self._rebuild_matrices_for_new_symbols()
+
+                    # Update depth manager watchlist
+                    await self.set_depth_watchlist(self.top_coins)
+
+                    logger.info("✅ Symbol refresh complete")
+                else:
+                    logger.debug("Symbol list unchanged")
+
+            except Exception as e:
+                logger.error(f"Symbol refresh failed: {e}")
+                await asyncio.sleep(300)  # Retry in 5 min on error
 
     async def fetch_historical_snapshot(self):
         """Fills the matrix with initial history."""
@@ -656,7 +1467,7 @@ class BinanceMarketDataCollector:
                     except Exception: pass
         logger.info("✔ Warmup Complete.")
 
-    async def _single_spot_ws_handler(self, streams: List[str], ws_id: int):
+    async def _single_futures_kline_handler(self, streams: List[str], ws_id: int):
         url = f"{self.spot_ws_base}/stream?streams=" + "/".join(streams)
         backoff = 1.0
         while self.running:
@@ -746,7 +1557,7 @@ class BinanceMarketDataCollector:
         while self.running:
             await asyncio.sleep(300)
             try:
-                tf = ['1m', '5m', '15m', '1h', '2h', '4h', '1d', '3d', '1w', '1M']
+                tf = ['1m', '5m', '15m', '1h', '4h', '1d']
 
                 active_tfs = []
                 total_symbols = 0
@@ -771,13 +1582,25 @@ class BinanceMarketDataCollector:
     async def run(self):
         logger.info("🚀 Data Collector Starting...")
         force_refresh = env_flag("FORCE_REFRESH")
-        
+
         if not force_refresh and await self.load_state():
             pass
         else:
-            await self.get_top_100_coins()
+            await self.fetch_top_coins()
             await self.fetch_historical_snapshot()
-        
+        self.liq_history_loader = LiquidationHistoryLoader(
+            liq_monitor=self.liq_monitor,
+            symbols=self.top_coins
+        )
+        # ← ADD THIS: Initialize futures data collector
+        self.futures_collector = FuturesDataCollector(
+            symbols=self.top_coins,
+            matrices=self.matrices
+        )
+        self.depth_liquidity_collector = DepthLiquidityCollector(
+            symbols=self.top_coins,
+            matrices=self.matrices
+        )
         tasks = []
         all_streams = []
         for s in self.top_coins:
@@ -786,12 +1609,16 @@ class BinanceMarketDataCollector:
                 
         chunks = [all_streams[i:i + 200] for i in range(0, len(all_streams), 200)]
         for i, chunk in enumerate(chunks):
-            tasks.append(asyncio.create_task(self._single_spot_ws_handler(chunk, i)))
+            tasks.append(asyncio.create_task(self._single_futures_kline_handler(chunk, i)))
 
         tasks.append(asyncio.create_task(self.calculation_loop()))
         tasks.append(asyncio.create_task(self.periodic_save_task()))
-        tasks.append(asyncio.create_task(self.futures_depth.run()))
         tasks.append(asyncio.create_task(self.health_log_task()))
+        tasks.append(asyncio.create_task(self.symbol_refresh_task()))  # ← ADD THIS LINE
+        tasks.append(asyncio.create_task(self.liq_history_loader.start()))
+        tasks.append(asyncio.create_task(self.futures_collector.run()))
+        tasks.append(asyncio.create_task(self.depth_liquidity_collector.run()))
+
         try:
             await asyncio.gather(*tasks)
         except Exception as e:

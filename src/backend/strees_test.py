@@ -248,6 +248,6 @@ if __name__ == "__main__":
     setup_directories()
     logging.disable(logging.CRITICAL)
     try:
-        asyncio.run(main(num_requests=500))
+        asyncio.run(main(num_requests=100))
     except KeyboardInterrupt:
         pass
