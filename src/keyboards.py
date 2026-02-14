@@ -94,6 +94,11 @@ def get_plans_keyboard() -> InlineKeyboardMarkup:
     keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="main_menu")])
     return InlineKeyboardMarkup(keyboard)
 
+def get_cancel_flow_keyboard() -> InlineKeyboardMarkup:
+    """Button to cancel current operation"""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel_flow")
+    ]])
 
 def get_plan_details_keyboard() -> InlineKeyboardMarkup:
     """Plan details menu keyboard"""

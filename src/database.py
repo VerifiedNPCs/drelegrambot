@@ -329,7 +329,8 @@ class DatabaseManager:
         self,
         user_id: int,
         plan: str,
-        duration_days: int = 30
+        duration_days: int = 30,
+        coin_count: int = 0,
     ) -> Optional[Dict[str, Any]]:
         """
         Create a new subscription (cancels existing active ones)
@@ -350,10 +351,10 @@ class DatabaseManager:
 
                     # Create new subscription
                     row = await conn.fetchrow("""
-                        INSERT INTO subscriptions (user_id, plan, status, start_date, end_date)
-                        VALUES ($1, $2, 'active', $3, $4)
+                        INSERT INTO subscriptions (user_id, plan, status, start_date, end_date, coin_count)
+                        VALUES ($1, $2, 'active', $3, $4, $5)
                         RETURNING *
-                    """, user_id, plan, start_date, end_date)
+                    """, user_id, plan, start_date, end_date, coin_count)
 
                     logger.info(f"Subscription created for user {user_id}: {plan}")
                     return dict(row) if row else None
@@ -792,6 +793,7 @@ class DatabaseManager:
         currency: str = "USD",
         crypto_currency: Optional[str] = None,
         gateway_name: Optional[str] = None,
+        coin_count: int = 0,
         expires_minutes: int = 30
     ) -> Optional[Dict]:
         """Create a new payment request"""
@@ -801,9 +803,9 @@ class DatabaseManager:
             
             query = """
                 INSERT INTO payment_requests 
-                (payment_id, user_id, plan, amount, currency, crypto_currency, gateway_name, expires_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING id, payment_id, user_id, plan, amount, status, created_at, expires_at
+                (payment_id, user_id, plan, amount, currency, crypto_currency, gateway_name, expires_at, coin_count)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING id, payment_id, user_id, plan, amount, status, created_at, expires_at, coin_count
             """
             
             row = await self.pool.fetchrow(

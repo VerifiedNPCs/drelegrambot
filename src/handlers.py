@@ -5,7 +5,7 @@ from payment import CryptoPaymentGateway
 from token_manager import TokenManager
 from payment_manager import PaymentManager
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, ConversationHandler, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 from datetime import datetime, timezone
 
 from config import Config
@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 # Database manager will be injected
 db_manager = None
 payment_manager = None
+SELECT_PLAN, ENTER_COINS = range(2)
+user_selections = {} # updating this with redis
 
 
 def set_db_manager(manager):
@@ -44,10 +46,13 @@ async def format_user_status(user_id: int) -> str:
 
         if subscription:
             plan_info = Config.get_plan(subscription['plan'])
+            # Show coin count if available
+            coin_count = subscription.get('coin_count', 0)
+            
             status += "📊 <b>Subscription Status</b>\n\n"
             status += f"Plan: {plan_info['emoji']} {plan_info['name']}\n"
-            status += f"Price: {plan_info['price']}\n"
-
+            status += f"Tracking Capacity: {coin_count} Coins\n"
+            
             days_left = await db_manager.get_days_left(user_id)
             if days_left is not None:
                 if days_left > 0:
@@ -92,6 +97,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if subscription:
                 days_left = await db_manager.get_days_left(user_id)
                 plan_info = Config.get_plan(subscription['plan'])
+                coin_count = subscription.get('coin_count', 0)
                 
                 success_text = (
                     "✅ <b>Payment Successful!</b>\n\n"
@@ -99,6 +105,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📊 <b>Subscription Details:</b>\n"
                     f"• Plan: {plan_info['emoji']} {plan_info['name']}\n"
                     f"• Price: {plan_info['price']}\n"
+                    f"• Capacity: {coin_count} Coins\n"
                     f"• Days Remaining: {days_left} days\n"
                     f"• Expires: {subscription['end_date'].strftime('%Y-%m-%d')}\n\n"
                     "Your premium features are ready to use! 🚀\n\n"
@@ -302,7 +309,12 @@ async def account_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def plans_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show available plans"""
-    text = "💳 <b>Choose Your Subscription Plan</b>\n\nSelect a plan that fits your needs:"
+    text = (
+        "💎 <b>Choose Subscription Plan</b>\n\n"
+        "Pricing is calculated based on the number of coins you want to track.\n"
+        "<i>Formula: Base Price + (Cost per Coin × Coin Count)</i>\n\n"
+        "Select a plan to continue:"
+    )
 
     try:
         await update.message.reply_text(
@@ -423,6 +435,198 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================================
+# PLAN SELECTION FLOW (Conversation)
+# ==========================================
+
+async def start_plan_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the plan selection process"""
+    query = update.callback_query
+    if query:
+        await query.answer()
+    
+    text = (
+        "💎 <b>Choose Your Subscription Plan</b>\n\n"
+        "Pricing is dynamic based on how many coins you track.\n"
+        "<i>Formula: Base Price + (Cost per Coin × Coin Count)</i>\n\n"
+        "Select a plan to continue:"
+    )
+    
+    # Use existing keyboard from keyboards.py
+    keyboard = get_plans_keyboard()
+    
+    if query:
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await update.message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
+        
+    return SELECT_PLAN
+
+async def handle_plan_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User selected a plan, now ask for coin count"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    # Handle "Back" button from plan selection
+    if data == "main_menu":
+        await start_command(update, context)
+        return ConversationHandler.END
+        
+    # Extract plan key (e.g., "plan_standard" -> "standard")
+    try:
+        plan_key = data.split("_")[1]
+    except IndexError:
+        await query.edit_message_text("❌ Invalid selection.")
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    
+    # Store selection
+    user_selections[user_id] = {"plan": plan_key}
+    
+    plan_info = Config.get_plan(plan_key)
+    
+    if not plan_info:
+        await query.edit_message_text("❌ Invalid plan selected.")
+        return ConversationHandler.END
+        
+    # Enterprise plan handling (Contact Sales)
+    if plan_key == "enterprise":
+        await query.edit_message_text(
+            "🚀 <b>Enterprise Plan</b>\n\n"
+            "For unlimited access and white-label solutions, please contact our sales team.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💬 Contact Support", url="https://t.me/drele_gram")
+            ], [
+                InlineKeyboardButton("« Back", callback_data="choose_plan")
+            ]]),
+            parse_mode="HTML"
+        )
+        return ConversationHandler.END
+
+    # Ask for coin count
+    text = (
+        f"{plan_info['emoji']} <b>{plan_info['name']} Selected</b>\n\n"
+        f"💰 Base Price: <b>${plan_info['base_price']}</b>\n"
+        f"➕ Cost per Coin: <b>${plan_info['cost_per_coin']}</b>\n"
+        f"🔢 Max Capacity: <b>{plan_info['max_coins']} coins</b>\n\n"
+        "👇 <b>How many coins do you want to track?</b>\n"
+        f"<i>Please enter a number between 1 and {plan_info['max_coins']}:</i>"
+    )
+    
+    await query.edit_message_text(
+        text, 
+        reply_markup=get_cancel_flow_keyboard(), # Use new keyboard
+        parse_mode="HTML"
+    )
+    return ENTER_COINS
+
+async def handle_coin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process coin count and generate invoice"""
+    user_id = update.effective_user.id
+    text = update.message.text
+    
+    # Check session
+    if user_id not in user_selections:
+        await update.message.reply_text("⚠️ Session expired. Please use /plans again.")
+        return ConversationHandler.END
+
+    plan_key = user_selections[user_id]["plan"]
+    plan_info = Config.get_plan(plan_key)
+    
+    try:
+        coin_count = int(text)
+        
+        # Validation
+        if coin_count < 1:
+            await update.message.reply_text(
+                "❌ Please enter at least 1 coin.",
+                reply_markup=get_cancel_flow_keyboard()
+            )
+            return ENTER_COINS
+            
+        if coin_count > plan_info['max_coins']:
+            await update.message.reply_text(
+                f"❌ Maximum allowed for {plan_info['name']} is {plan_info['max_coins']} coins.\n"
+                "Please enter a lower number:",
+                reply_markup=get_cancel_flow_keyboard()
+            )
+            return ENTER_COINS
+            
+        # Calculate Total Price
+        total_price = Config.calculate_price(plan_key, coin_count)
+        
+        # Create Payment Request in DB
+        payment_request = await db_manager.create_payment_request(
+            user_id=user_id,
+            plan=plan_key,
+            amount=total_price,
+            currency="USD",
+            crypto_currency="USDT", # Default
+            gateway_name="manual",
+            coin_count=coin_count
+        )
+        
+        if not payment_request:
+            await update.message.reply_text("❌ Error generating payment link. Please try again.")
+            return ConversationHandler.END
+
+        # Generate Payment URL
+        payment_url = f"{Config.PAYMENT_URL}?payment_id={payment_request['payment_id']}"
+        await db_manager.update_payment_request(
+            payment_request['payment_id'], 
+            status="pending", 
+            payment_url=payment_url
+        )
+
+        # Send Invoice
+        await update.message.reply_text(
+            f"🧾 <b>Bill Summary</b>\n\n"
+            f"📦 <b>Plan:</b> {plan_info['name']}\n"
+            f"🪙 <b>Tracking:</b> {coin_count} Coins\n\n"
+            f"<b>Calculation:</b>\n"
+            f"${plan_info['base_price']} (Base) + ({coin_count} × ${plan_info['cost_per_coin']})\n"
+            f"-----------------------------------\n"
+            f"💰 <b>TOTAL: ${total_price}</b>\n\n"
+            "Click the button below to pay via Crypto:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Pay Now", url=payment_url)],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_flow")]
+            ]),
+            parse_mode="HTML"
+        )
+        
+        # Clear session
+        if user_id in user_selections:
+            del user_selections[user_id]
+            
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Please enter a valid number (e.g., 10).",
+            reply_markup=get_cancel_flow_keyboard()
+        )
+        return ENTER_COINS
+
+async def cancel_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the conversation"""
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await query.edit_message_text("❌ Selection cancelled.")
+        # Optional: Show main menu again
+        await start_command(update, context)
+        
+    user_id = update.effective_user.id
+    if user_id in user_selections:
+        del user_selections[user_id]
+        
+    return ConversationHandler.END
+
+
+# ==========================================
 # Callback Query Handler
 # ==========================================
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -491,16 +695,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not db_user:
             await query.edit_message_text(
                 "❌ Please create an account first!",
-                reply_markup=get_main_menu_keyboard(),
+                reply_markup=get_main_menu_keyboard(user_id),
                 parse_mode="HTML"
             )
         else:
-            text = "💳 <b>Choose Your Subscription Plan</b>\n\nSelect a plan that fits your needs:"
-            await query.edit_message_text(
-                text,
-                reply_markup=get_plans_keyboard(),
-                parse_mode="HTML"
-            )
+            # Redirect to conversation handler
+            await start_plan_selection(update, context)
 
     elif data == "plan_details":
         text = "📋 <b>Subscription Plans Overview</b>\n\nSelect a plan to see detailed information:"

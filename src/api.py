@@ -458,6 +458,7 @@ async def get_payment_details(payment_id: str):
         "id": payment['payment_id'],
         "plan": payment['plan'],
         "amount": float(payment['amount']),
+        "coin_count": payment.get('coin_count', 0),
         "userId": str(payment['user_id']),
         "status": payment['status']
     }

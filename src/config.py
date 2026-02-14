@@ -61,55 +61,37 @@ class Config:
     SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
         "standard": {
             "name": "Standard Plan",
-            "price": "$9.99/month",
+            "base_price": 9.99,
+            "cost_per_coin": 0.50,
+            "max_coins": 50,
             "duration_days": 30,
-            "features": [
-                "✓ Basic features access",
-                "✓ 5 API calls per day",
-                "✓ Email support",
-                "✓ 1 user account"
-            ],
+            "features": ["Real-Time Market Watch", "Pump/Dump Detection", "Market Rankings"],
             "emoji": "📦"
         },
         "pro": {
             "name": "Pro Plan",
-            "price": "$29.99/month",
-            "duration_days": 30,
-            "features": [
-                "✓ All Standard features",
-                "✓ 100 API calls per day",
-                "✓ Priority support",
-                "✓ 5 user accounts",
-                "✓ Advanced analytics"
-            ],
+            "base_price": 29.99,
+            "cost_per_coin": 1.50,
+            "max_coins": 100,
+            "features": ["Technical Validation (RSI/MACD)", "Price Snapshots", "Liquidation Data"],
             "emoji": "⭐"
         },
         "business+": {
             "name": "Business+ Plan",
-            "price": "$79.99/month",
+            "base_price": 79.99,
+            "cost_per_coin": 2.00,
+            "max_coins": 200,
             "duration_days": 30,
-            "features": [
-                "✓ All Pro features",
-                "✓ Unlimited API calls",
-                "✓ 24/7 dedicated support",
-                "✓ 20 user accounts",
-                "✓ Custom integrations",
-                "✓ White-label options"
-            ],
+            "features": ["Order Signals", "Order Tracking", "High-Frequency Scanning"],
             "emoji": "💼"
         },
         "enterprise+": {
             "name": "Enterprise+ Plan",
-            "price": "Custom pricing",
+            "base_price": 499.00, 
+            "cost_per_coin": 0.00,
+            "max_coins": 9999,
             "duration_days": 30,
-            "features": [
-                "✓ All Business+ features",
-                "✓ Unlimited user accounts",
-                "✓ Dedicated account manager",
-                "✓ SLA guarantee",
-                "✓ On-premise deployment",
-                "✓ Custom development"
-            ],
+            "features": ["White-Labeling", "Dedicated Server", "API Access"],
             "emoji": "🏢"
         }
     }
@@ -211,3 +193,17 @@ class Config:
     def is_admin(cls, user_id: int) -> bool:
         """Check if user is admin"""
         return user_id in cls.ADMIN_USER_IDS
+
+    @classmethod
+    def calculate_price(cls, plan_key: str, coin_count: int) -> float:
+        """Calculate total price based on plan and coin count"""
+        plan = cls.SUBSCRIPTION_PLANS.get(plan_key)
+        if not plan:
+            return 0.0
+        
+        # Enterprise logic is custom, return base for now
+        if plan_key == "enterprise":
+            return plan["base_price"]
+            
+        total = plan["base_price"] + (plan["cost_per_coin"] * coin_count)
+        return round(total, 2)
