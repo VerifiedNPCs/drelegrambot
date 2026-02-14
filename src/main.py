@@ -9,6 +9,7 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    ConversationHandler,
     filters,
 )
 
@@ -27,6 +28,12 @@ from handlers import (
     handle_email,
     error_handler,
     set_db_manager,
+    SELECT_PLAN,
+    ENTER_COINS,
+    start_plan_selection,
+    handle_plan_choice,
+    handle_coin_input,
+    cancel_flow,
 )
 
 
@@ -228,6 +235,29 @@ def build_application() -> Application:
     # Register Handlers
     # ==========================================
 
+    plans_conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('plans', start_plan_selection),
+            CallbackQueryHandler(start_plan_selection, pattern='^choose_plan$')
+        ],
+        states={
+            SELECT_PLAN: [
+                CallbackQueryHandler(handle_plan_choice, pattern='^plan_'),
+                CallbackQueryHandler(start_command, pattern='^main_menu$')
+            ],
+            ENTER_COINS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_coin_input),
+                CallbackQueryHandler(cancel_flow, pattern='^cancel_flow$')
+            ]
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel_flow),
+            CallbackQueryHandler(cancel_flow, pattern='^cancel_flow$')
+        ]
+    )
+    app.add_handler(plans_conv_handler)
+    logger.info("✓ ConversationHandler registered")
+    
     # Command handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))

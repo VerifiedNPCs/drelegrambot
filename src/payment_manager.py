@@ -2,7 +2,7 @@
 Payment logic manager for handling subscriptions, upgrades, and downgrades
 """
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from config import Config
 from database import DatabaseManager
 
@@ -12,85 +12,107 @@ class PaymentManager:
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
 
-    async def calculate_proration(self, user_id: int, new_plan_key: str):
+    async def calculate_proration(self, user_id: int, new_plan_key: str, coin_count: int = None):
         """
         Calculate upgrade/downgrade cost and credit.
         Returns dict with cost, credit, new_expiry details.
+        
+        Args:
+            user_id: User ID
+            new_plan_key: Target plan key (standard/pro/business)
+            coin_count: Number of coins to track (if None, uses current subscription's count)
         """
         try:
             # 1. Get current subscription
             current_sub = await self.db.get_active_subscription(user_id)
             new_plan_info = Config.get_plan(new_plan_key)
             
-            # Extract numeric price (e.g., "$29.99/month" -> 29.99)
-            new_price = float(new_plan_info['price'].replace('$', '').split('/')[0])
+            # Determine coin count
+            if coin_count is None:
+                # If switching plans, keep current coin count
+                if current_sub and 'coin_count' in current_sub:
+                    coin_count = current_sub['coin_count']
+                else:
+                    # Default to minimum (1 coin) if not specified
+                    coin_count = 1
+            
+            # Calculate new price using dynamic pricing
+            new_price = Config.calculate_price(new_plan_key, coin_count)
 
             # CASE A: New User or Expired Subscription
             if not current_sub:
                 return {
                     'cost_to_pay': new_price,
                     'credit_applied': 0.0,
-                    'new_expiry': datetime.utcnow() + timedelta(days=30),
+                    'new_expiry': datetime.now(timezone.utc) + timedelta(days=30),
                     'is_upgrade': True,
-                    'message': "New Subscription"
+                    'message': "New Subscription",
+                    'coin_count': coin_count
                 }
 
             # CASE B: Active Subscription Switch
             current_plan_key = current_sub['plan']
+            current_coin_count = current_sub.get('coin_count', 1)
             
-            # If same plan, just extend
-            if current_plan_key == new_plan_key:
-                 return {
+            # Calculate current plan price with current coin count
+            current_price = Config.calculate_price(current_plan_key, current_coin_count)
+            
+            # If same plan AND same coin count, just extend
+            if current_plan_key == new_plan_key and current_coin_count == coin_count:
+                return {
                     'cost_to_pay': new_price,
                     'credit_applied': 0.0,
                     'new_expiry': current_sub['end_date'] + timedelta(days=30),
                     'is_upgrade': False,
-                    'message': "Renewal"
+                    'message': "Renewal",
+                    'coin_count': coin_count
                 }
 
-            current_plan_info = Config.get_plan(current_plan_key)
-            current_price = float(current_plan_info['price'].replace('$', '').split('/')[0])
-            
             # Calculate days remaining/unused value
-            now = datetime.utcnow()
-            # Ensure naive datetimes for calculation
-            expiry = current_sub['end_date'].replace(tzinfo=None) if current_sub['end_date'].tzinfo else current_sub['end_date']
+            now = datetime.now(timezone.utc)
+            # Ensure timezone-aware datetime
+            expiry = current_sub['end_date']
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
             
             if expiry <= now:
-                 return {
+                return {
                     'cost_to_pay': new_price,
                     'credit_applied': 0.0,
                     'new_expiry': now + timedelta(days=30),
                     'is_upgrade': True,
-                    'message': "Renewal (Expired)"
+                    'message': "Renewal (Expired)",
+                    'coin_count': coin_count
                 }
 
             days_remaining = (expiry - now).days
-            if days_remaining < 0: days_remaining = 0
+            if days_remaining < 0: 
+                days_remaining = 0
             
             # Calculate Unused Value (Daily Rate * Days Remaining)
             # Using 30-day standard month
             daily_rate = current_price / 30.0 
             unused_value = daily_rate * days_remaining
 
-            logger.info(f"User {user_id}: Switching {current_plan_key} (${current_price}) -> {new_plan_key} (${new_price})")
+            logger.info(f"User {user_id}: Switching {current_plan_key} ({current_coin_count} coins, ${current_price}) -> {new_plan_key} ({coin_count} coins, ${new_price})")
             logger.info(f"Days left: {days_remaining}, Unused Value: ${unused_value:.2f}")
 
             # Calculate Difference
             cost_difference = new_price - unused_value
             
             if cost_difference > 0:
-                # UPGRADE: Pay difference
-                # Expiry starts fresh 30 days from now (simplest approach for upgrades)
+                # UPGRADE/INCREASE: Pay difference
+                # Expiry starts fresh 30 days from now
                 return {
                     'cost_to_pay': round(cost_difference, 2),
                     'credit_applied': round(unused_value, 2),
                     'new_expiry': now + timedelta(days=30),
                     'is_upgrade': True,
-                    'message': f"Upgrade from {current_plan_info['name']}"
+                    'message': f"Upgrade from {new_plan_info['name']}",
+                    'coin_count': coin_count
                 }
             else:
-                # DOWNGRADE: Credit covers cost
+                # DOWNGRADE/DECREASE: Credit covers cost
                 # Pay $0, remaining credit extends duration
                 credit_surplus = abs(cost_difference) 
                 
@@ -108,16 +130,20 @@ class PaymentManager:
                     'credit_applied': round(unused_value, 2),
                     'new_expiry': now + timedelta(days=total_days),
                     'is_upgrade': False,
-                    'message': f"Downgrade from {current_plan_info['name']}"
+                    'message': f"Downgrade from {new_plan_info['name']}",
+                    'coin_count': coin_count
                 }
                 
         except Exception as e:
             logger.exception(f"Error calculating proration: {e}")
             # Fallback to full price on error
+            fallback_coins = coin_count if coin_count else 1
+            fallback_price = Config.calculate_price(new_plan_key, fallback_coins)
             return {
-                'cost_to_pay': new_price,
+                'cost_to_pay': fallback_price,
                 'credit_applied': 0.0,
-                'new_expiry': datetime.utcnow() + timedelta(days=30),
+                'new_expiry': datetime.now(timezone.utc) + timedelta(days=30),
                 'is_upgrade': True,
-                'message': "Error Fallback"
+                'message': "Error Fallback",
+                'coin_count': fallback_coins
             }

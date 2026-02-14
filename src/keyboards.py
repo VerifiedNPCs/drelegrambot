@@ -21,17 +21,18 @@ def get_dashboard_keyboard(dashboard_url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def get_payment_plans_keyboard() -> InlineKeyboardMarkup:
-    """Payment selection for subscription plans"""
+    """Payment selection for subscription plans (legacy - might not be used)"""
     keyboard = []
     for plan_key, plan_info in Config.SUBSCRIPTION_PLANS.items():
         keyboard.append([
             InlineKeyboardButton(
-                f"💳 Pay for {plan_info['name']} - {plan_info['price']}",
+                f"💳 Pay for {plan_info['name']} (Base ${plan_info['base_price']})",
                 callback_data=f"pay_{plan_key}"
             )
         ])
     keyboard.append([InlineKeyboardButton("« Back", callback_data="my_account")])
     return InlineKeyboardMarkup(keyboard)
+
 
 def get_cancel_confirmation_keyboard() -> InlineKeyboardMarkup:
     """Warning keyboard for cancellation"""
@@ -87,12 +88,13 @@ def get_plans_keyboard() -> InlineKeyboardMarkup:
     for plan_key, plan_info in Config.SUBSCRIPTION_PLANS.items():
         keyboard.append([
             InlineKeyboardButton(
-                f"{plan_info['emoji']} {plan_info['name']} - {plan_info['price']}",
+                f"{plan_info['emoji']} {plan_info['name']} (Base ${plan_info['base_price']})",
                 callback_data=f"plan_{plan_key}"
             )
         ])
     keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="main_menu")])
     return InlineKeyboardMarkup(keyboard)
+
 
 def get_cancel_flow_keyboard() -> InlineKeyboardMarkup:
     """Button to cancel current operation"""

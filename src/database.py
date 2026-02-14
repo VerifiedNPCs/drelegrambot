@@ -810,7 +810,7 @@ class DatabaseManager:
             
             row = await self.pool.fetchrow(
                 query, payment_id, user_id, plan, amount, currency, 
-                crypto_currency, gateway_name, expires_at
+                crypto_currency, gateway_name, expires_at, coin_count
             )
             
             return dict(row) if row else None
