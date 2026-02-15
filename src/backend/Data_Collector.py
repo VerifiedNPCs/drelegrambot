@@ -1373,6 +1373,10 @@ class BinanceMarketDataCollector:
             "up_price": up_price,
             "bid_notional": float(np.sum(bid_bins)),
             "ask_notional": float(np.sum(ask_bins)),
+            "bid_bins": bid_bins.astype(np.float32).tolist() if isinstance(bid_bins, np.ndarray) else list(bid_bins),
+            "ask_bins": ask_bins.astype(np.float32).tolist() if isinstance(ask_bins, np.ndarray) else list(ask_bins),
+            "bins": {"bid_bins": bid_bins.astype(np.float32).tolist() if isinstance(bid_bins, np.ndarray) else list(bid_bins),
+                     "ask_bins": ask_bins.astype(np.float32).tolist() if isinstance(ask_bins, np.ndarray) else list(ask_bins)},
             "book_ts_ms": int(time.time() * 1000)
         }
 

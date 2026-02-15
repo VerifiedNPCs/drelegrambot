@@ -4,12 +4,13 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes, CallbackQueryHandler
 from telegram.error import RetryAfter, TimedOut, BadRequest, NetworkError
-
+import time
 from config import config, setup_logging
 from database import SUBS, USER_SETTINGS
 import services
 import image_generator
 logger = setup_logging("BotHandlers")
+
 # --- Utilities ---
 def escape_html(text: str) -> str:
     return html.escape(str(text))
@@ -27,10 +28,8 @@ async def safe_answer(query) -> None:
     try:
         await query.answer()
     except (TimedOut, NetworkError):
-        # Network lag; user probably won't notice.
         pass
     except BadRequest:
-        # Query likely too old or already answered.
         pass
     except Exception as e:
         logger.warning(f"⚠ Callback answer failed: {e}")
@@ -39,7 +38,7 @@ async def safe_send_message(context, chat_id: int, text: str, **kwargs) -> bool:
     """Robust message sender that handles Retries and Timeouts"""
     pm = kwargs.pop('parse_mode', None)
     try:
-        for attempt in range(config.MAX_RETRIES):
+        for attempt in range(getattr(config, 'MAX_RETRIES', 3)):
             try:
                 await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=pm, **kwargs)
                 return True
@@ -47,9 +46,9 @@ async def safe_send_message(context, chat_id: int, text: str, **kwargs) -> bool:
                 sleep_time = getattr(e, 'retry_after', 2.0)
                 await asyncio.sleep(sleep_time)
             except Exception:
-                if attempt == config.MAX_RETRIES - 1:
+                if attempt == getattr(config, 'MAX_RETRIES', 3) - 1:
                     logger.warning(f"⚠ Failed to send message to {chat_id} after retries")
-                await asyncio.sleep(config.RETRY_DELAY)
+                await asyncio.sleep(getattr(config, 'RETRY_DELAY', 1.0))
     except Exception:
         logger.error("Critical error in safe_send_message", exc_info=False)
     return False
@@ -72,28 +71,26 @@ def _build_tf_keyboard(prefix: str, user_tf: str = None) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(buttons)
 
 async def _send_leaderboard_image(context, chat_id, tf, img_data, caption):
+    """
+    Uses services.get_generated_image which caches and returns a BytesIO-like buffer.
+    We enrich cache key with depth/liquidation hints when available to improve cache hits.
+    """
     try:
         if not img_data:
             await safe_send_message(context, chat_id, "No data available.")
             return
 
         await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
-        
-        # --- NEW: GENERATE CACHE KEY ---
-        # Create a unique key based on the content. 
-        # For leaderboards: "top_1h", "vol_4h" etc. 
-        # For symbols: "SYM_BTCUSDT_1h" etc.
-        # We can approximate this by hashing the first symbol + TF + length
-        first_sym = img_data[0]['symbol'] if img_data else "NONE"
-        cache_key = f"{tf}_{first_sym}_{len(img_data)}_{caption[:10]}"
 
-        # --- NEW: USE CACHED SERVICE ---
-        # This replaces the manual enrich + run_in_executor calls
-        photo_buf = await services.get_generated_image(
-            cache_key, 
-            img_data, 
-            config.DEPTH_TARGET_USDT
-        )
+        # Build compact cache key using first symbol, timeframe, and depth hints if present
+        first_sym = img_data[0].get('symbol_raw', img_data[0].get('symbol', 'NONE'))
+        depth_hint = ""
+        di = img_data[0].get('depth_info') or {}
+        if di:
+            depth_hint = f"_{int(di.get('down_pct',0))}_{int(di.get('up_pct',0))}"
+        cache_key = f"{tf}_{first_sym}_{len(img_data)}_{caption[:10]}{depth_hint}"
+
+        photo_buf = await services.get_generated_image(cache_key, img_data, getattr(config, 'DEPTH_TARGET_USDT', 250000))
 
         if photo_buf:
             try:
@@ -105,7 +102,10 @@ async def _send_leaderboard_image(context, chat_id, tf, img_data, caption):
                     parse_mode=ParseMode.MARKDOWN
                 )
             finally:
-                photo_buf.close()
+                try:
+                    photo_buf.close()
+                except Exception:
+                    pass
         else:
             await safe_send_message(context, chat_id, "⚠ Error generating image.")
     except Exception:
@@ -113,6 +113,12 @@ async def _send_leaderboard_image(context, chat_id, tf, img_data, caption):
         await safe_send_message(context, chat_id, "⚠ Failed to generate image.")
 
 async def _send_leaderboard(update, context, tf: str, sort_key: str, title: str):
+    """
+    Fetch leaderboard rows from services.get_leaderboard and enrich each row with:
+      - recent history via services.get_symbol_data
+      - depth info via collector.get_depth_liquidity_range (if available)
+      - liquidation stats via collector.get_liq_stats (if available)
+    """
     raw_data = await services.get_leaderboard(tf, sort_key, limit=10)
 
     if not raw_data:
@@ -120,22 +126,60 @@ async def _send_leaderboard(update, context, tf: str, sort_key: str, title: str)
         return
 
     img_data = []
+    collector = getattr(services, 'COLLECTOR', None)
+
     for row in raw_data:
-        sym = row['symbol']
+        sym = row.get('symbol')
         symbol_data = await services.get_symbol_data(tf, sym, limit=20)
+
+        # Enrich with depth and liquidation if collector exists
+        depth_info = None
+        liq_info = None
+        try:
+            if collector:
+                depth_info = collector.get_depth_liquidity_range(sym, target_usdt=getattr(config, 'DEPTH_TARGET_USDT', 250000))
+                liq_info = collector.get_liq_stats(sym)
+
+                # --- Add recent liquidation events (last 24h) for plotting ---
+                liq_events = []
+                try:
+                    # collector.liq_monitor.history is deque of (ts, sym, side, usd, price)
+                    hist = getattr(collector, 'liq_monitor', None)
+                    if hist and hasattr(hist, 'history'):
+                        now_ts = time.time()
+                        cutoff = now_ts - 86400  # last 24h
+                        with hist._lock:
+                            for ev in list(hist.history):
+                                ev_ts, ev_sym, ev_side, ev_usd, ev_price = ev
+                                if ev_sym.upper() != sym.upper():
+                                    continue
+                                if ev_ts < cutoff:
+                                    continue
+                                # store ms timestamp for consistency with other timestamps
+                                liq_events.append({"ts_ms": int(ev_ts * 1000), "side": ev_side, "usd": ev_usd, "price": ev_price})
+                except Exception:
+                    liq_events = []
+        except Exception:
+            depth_info = None
+            liq_info = None
+            liq_events = []
 
         img_data.append({
             'symbol': sym,
             'symbol_raw': sym,
             'depth_symbol': sym,
             'tf': tf,
-            'price': row['close'],
-            'change': row['change'],
+            'price': float(row.get('price', row.get('close', 0))),
+            'change': float(row.get('change', 0)),
             'history': symbol_data.get('close', []),
-            'rsi': row.get('rsi', 50),
-            'mfi': row.get('mfi', 50),
-            'adx': row.get('adx', 0),
-            'usdt_volume': row.get('usdt_volume', 0)
+            'rsi': float(row.get('rsi', 50)),
+            'mfi': float(row.get('mfi', 50)),
+            'adx': float(row.get('adx', 0)),
+            'usdt_volume': float(row.get('usdt_volume', 0)),
+            'depth_info': depth_info,
+            'liq_info': liq_info,
+            'liq_events': liq_events
+            
         })
 
     caption = f"{title} ({tf})"
@@ -194,7 +238,7 @@ async def alerts_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     async with services.ENGINE.lock:
-        alerts = services.ENGINE.alerts_history[-15:]
+        alerts = services.ENGINE.alerts_history[-30:]
         alerts.sort(key=lambda x: getattr(x, 'score', 0), reverse=True)
 
     if not alerts:
@@ -204,10 +248,13 @@ async def alerts_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     img_data = []
     for a in alerts:
         symbol_data = await services.get_symbol_data(a.timeframe, a.symbol, limit=20)
-        
+
+        # Prefer collector analysis if available
         mfi_val = 50
         adx_val = 0
         usdt_vol = 0
+        depth_info = None
+        liq_info = None
         try:
             if services.COLLECTOR and a.timeframe in services.COLLECTOR.matrices:
                 analysis = services.COLLECTOR.matrices[a.timeframe].get_analysis()
@@ -218,6 +265,14 @@ async def alerts_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     usdt_vol = d.get('price', 0) * d.get('volume', 0)
         except Exception:
             pass
+
+        try:
+            if services.COLLECTOR:
+                depth_info = services.COLLECTOR.get_depth_liquidity_range(a.symbol, target_usdt=getattr(config, 'DEPTH_TARGET_USDT', 250000))
+                liq_info = services.COLLECTOR.get_liq_stats(a.symbol)
+        except Exception:
+            depth_info = None
+            liq_info = None
 
         img_data.append({
             'symbol': a.symbol,
@@ -230,7 +285,9 @@ async def alerts_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             'rsi': getattr(a, 'rsi', 50),
             'mfi': mfi_val,
             'adx': adx_val,
-            'usdt_volume': usdt_vol
+            'usdt_volume': usdt_vol,
+            'depth_info': depth_info,
+            'liq_info': liq_info
         })
 
     await _send_leaderboard_image(context, update.effective_chat.id, 'ALL', img_data, "🚨 **Recent Alerts (Sorted)**")
@@ -241,7 +298,7 @@ async def alerts_by_tf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     async with services.ENGINE.lock:
         tf_alerts = [a for a in services.ENGINE.alerts_history if a.timeframe == tf]
-        tf_alerts = tf_alerts[-15:]
+        tf_alerts = tf_alerts[-30:]
         tf_alerts.sort(key=lambda x: getattr(x, 'change_pct', 0), reverse=True)
 
     if not tf_alerts:
@@ -260,6 +317,16 @@ async def alerts_by_tf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         symbol_data = await services.get_symbol_data(a.timeframe, a.symbol, limit=20)
         d = analysis.get(a.symbol, {})
 
+        depth_info = None
+        liq_info = None
+        try:
+            if services.COLLECTOR:
+                depth_info = services.COLLECTOR.get_depth_liquidity_range(a.symbol, target_usdt=getattr(config, 'DEPTH_TARGET_USDT', 250000))
+                liq_info = services.COLLECTOR.get_liq_stats(a.symbol)
+        except Exception:
+            depth_info = None
+            liq_info = None
+
         img_data.append({
             'symbol': a.symbol,
             'symbol_raw': a.symbol,
@@ -271,7 +338,9 @@ async def alerts_by_tf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             'rsi': getattr(a, 'rsi', 50),
             'mfi': d.get('mfi', 50),
             'adx': d.get('adx', 0),
-            'usdt_volume': d.get('price', 0) * d.get('volume', 0)
+            'usdt_volume': d.get('price', 0) * d.get('volume', 0),
+            'depth_info': depth_info,
+            'liq_info': liq_info
         })
 
     await _send_leaderboard_image(context, update.effective_chat.id, tf, img_data, f"🚨 **Recent Alerts ({tf})**")
@@ -318,6 +387,16 @@ async def symbol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                         usdt_vol = d.get('price', 0.0) * d.get('volume', 0.0)
             except Exception:
                 pass
+            # Depth & liquidation enrichment for symbol view
+            depth_info = None
+            liq_info = None
+            try:
+                if services.COLLECTOR:
+                    depth_info = services.COLLECTOR.get_depth_liquidity_range(sym, target_usdt=getattr(config, 'DEPTH_TARGET_USDT', 250000))
+                    liq_info = services.COLLECTOR.get_liq_stats(sym)
+            except Exception:
+                depth_info = None
+                liq_info = None
 
             img_data.append({
                 'symbol': f"{sym} ({tf})",
@@ -330,7 +409,9 @@ async def symbol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 'rsi': rsi_val,
                 'mfi': mfi_val,
                 'adx': adx_val,
-                'usdt_volume': usdt_vol
+                'usdt_volume': usdt_vol,
+                'depth_info': depth_info,
+                'liq_info': liq_info
             })
 
     if not img_data:
