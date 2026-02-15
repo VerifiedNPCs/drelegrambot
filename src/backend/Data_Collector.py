@@ -1299,31 +1299,83 @@ class BinanceMarketDataCollector:
     def get_depth_liquidity_range(
         self,
         symbol: str,
-        target_usdt: float = 0,  # Unused now, kept for compatibility
+        target_usdt: float = 250000,
         mid_price: Optional[float] = None
     ) -> Optional[Dict[str, float]]:
+        """
+        Returns calculated liquidity ranges for image generator.
+        Calculates how far price needs to move (+/- %) to hit `target_usdt` wall.
+        """
+        # Always check 1m matrix for freshest price & depth data
         matrix = self.matrices.get('1m')
-        if not matrix:
-            return None
-            
+        if not matrix: return None
+        
         idx = matrix.symbol_map.get(symbol)
-        if idx is None:
-            return None
-            
+        if idx is None: return None
+        
         with matrix.lock:
-            bid_liq = float(matrix.liquidity_bid_5pct[idx])
-            ask_liq = float(matrix.liquidity_ask_5pct[idx])
-            price = float(matrix.closes[idx, -1])
+            # 1. Get raw bins (20 bins, 0.25% each)
+            bid_bins = matrix.liquidity_bid_bins[idx]
+            ask_bins = matrix.liquidity_ask_bins[idx]
+            current_price = float(matrix.closes[idx, -1])
+        
+        if current_price <= 0: return None
+        
+        # 2. Calculate Downside (-X% to hit target_usdt)
+        cum_bid = 0.0
+        down_pct = 0.0
+        BIN_WIDTH = 0.25
+        
+        for i in range(20):
+            bin_val = float(bid_bins[i])
+            if (cum_bid + bin_val) >= target_usdt:
+                # Interpolate within this bin
+                needed = target_usdt - cum_bid
+                fraction = needed / bin_val if bin_val > 0 else 0
+                down_pct = (i * BIN_WIDTH) + (fraction * BIN_WIDTH)
+                cum_bid += bin_val
+                break
+            cum_bid += bin_val
+            down_pct = (i + 1) * BIN_WIDTH # Full bin used
             
+        # If we exhausted all bins and still didn't hit target
+        if cum_bid < target_usdt:
+            down_pct = 5.0 # Max range cap
+            
+        down_price = current_price * (1 - (down_pct / 100.0))
+
+        # 3. Calculate Upside (+X% to hit target_usdt)
+        cum_ask = 0.0
+        up_pct = 0.0
+        
+        for i in range(20):
+            bin_val = float(ask_bins[i])
+            if (cum_ask + bin_val) >= target_usdt:
+                needed = target_usdt - cum_ask
+                fraction = needed / bin_val if bin_val > 0 else 0
+                up_pct = (i * BIN_WIDTH) + (fraction * BIN_WIDTH)
+                cum_ask += bin_val
+                break
+            cum_ask += bin_val
+            up_pct = (i + 1) * BIN_WIDTH
+            
+        if cum_ask < target_usdt:
+            up_pct = 5.0
+            
+        up_price = current_price * (1 + (up_pct / 100.0))
+
         return {
             "symbol": symbol,
-            "mid_price": price,
-            "bid_liquidity_5pct": bid_liq,
-            "ask_liquidity_5pct": ask_liq,
-            "total_liquidity_5pct": bid_liq + ask_liq,
-            "bid_bins": matrix.liquidity_bid_bins[idx].tolist(),  # Convert to list for JSON/Bot
-            "ask_bins": matrix.liquidity_ask_bins[idx].tolist()
+            "mid": current_price,
+            "down_pct": down_pct,
+            "up_pct": up_pct,
+            "down_price": down_price,
+            "up_price": up_price,
+            "bid_notional": float(np.sum(bid_bins)),
+            "ask_notional": float(np.sum(ask_bins)),
+            "book_ts_ms": int(time.time() * 1000)
         }
+
     
     def get_liq_stats(self, symbol: str) -> dict:
         """Accessor for Telegram Bot to get liquidation stats."""

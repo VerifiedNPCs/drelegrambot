@@ -13,11 +13,20 @@ from collections import defaultdict, Counter
 try:
     from config import config, setup_logging
 except ImportError:
-    raise ImportError("CRITICAL: config.py not found. Please ensure config.py is in the root directory.")
+    # Fallback config if missing (for standalone testing)
+    class Config:
+        ALERT_REFRESH_RATE = 2.0
+        PUMP_THRESHOLD_PCT = 2.5
+        DUMP_THRESHOLD_PCT = -2.5
+        VOLUME_SPIKE_RATIO = 3.0
+        MIN_ATR_MOVES = 2.0
+    config = Config()
+    
+    def setup_logging(name):
+        return logging.getLogger(name)
 
 # Init Logger
 logger = setup_logging("MarketEngine")
-
 
 # ==============================================================================
 # 🚨 DATA STRUCTURES
@@ -35,7 +44,11 @@ class MarketEvent:
     score: int      # 0-100
     timestamp: float
     urgency: int    # 1=Med, 2=High
-
+    
+    # Extra context for UI/Logs
+    funding_rate: float = 0.0
+    oi_value: float = 0.0
+    liq_5pct: float = 0.0
 
 # ==============================================================================
 # ⚙️ MARKET ENGINE (Vectorized, Futures-Aware)
@@ -52,16 +65,17 @@ class MarketEngine:
         self.signal_states = defaultdict(lambda: defaultdict(dict))
         
         # Hyper-Sensitivity Tracking: {symbol: count}
-        # Tracks how many times a symbol has alerted recently to boost its score
         self.hot_symbols = defaultdict(int)
 
         # Scanning settings (match collector timeframes)
-        self.scan_tfs = ['1m', '5m', '1h', '1d']
+        self.scan_tfs = ['1m', '5m', '15m', '1h', '4h', '1d']
         self.cooldown_map = {
             '1m': 60,
             '5m': 300,
+            '15m': 900,
             '1h': 3600,
-            '1d': 43200,
+            '4h': 14400,
+            '1d': 86400,
         }
 
     async def start_background_task(self):
@@ -72,7 +86,7 @@ class MarketEngine:
                 await self.scan_markets_vectorized()
                 await asyncio.sleep(getattr(config, 'ALERT_REFRESH_RATE', 2.0))
             except Exception as e:
-                logger.error(f"Analysis Loop Crash: {e}")
+                logger.error(f"Analysis Loop Crash: {e}", exc_info=True)
                 await asyncio.sleep(5)
 
     async def scan_markets_vectorized(self):
@@ -89,7 +103,7 @@ class MarketEngine:
         atr_min_moves = getattr(config, 'MIN_ATR_MOVES', 2.0)
 
         # Clean up hot symbols counter every cycle (decay)
-        if len(self.hot_symbols) > 200:
+        if len(self.hot_symbols) > 500: # Increased limit slightly
             self.hot_symbols.clear()
 
         for tf in self.scan_tfs:
@@ -99,19 +113,24 @@ class MarketEngine:
             matrix = self.collector.matrices[tf]
             
             # --- 1. Thread-Safe Snapshot (Fast Copy) ---
+            # We copy strictly what we need to minimize lock time
             with matrix.lock:
                 if matrix.closes.shape[1] < 2:
                     continue
                 
+                # Slicing numpy arrays creates a view, but for safety across threads we copy
                 closes = matrix.closes[:, -1].copy()
                 opens = matrix.closes[:, -2].copy()
                 rsi = matrix.rsi.copy()
                 vol_z = matrix.vol_z.copy()
-                atr = getattr(matrix, "atr", np.zeros_like(closes))
-                funding = getattr(matrix, "funding_rate", np.zeros_like(closes))
-                oi = getattr(matrix, "open_interest", np.zeros_like(closes))
-                bid_liq = getattr(matrix, "liquidity_bid_5pct", np.zeros_like(closes))
-                ask_liq = getattr(matrix, "liquidity_ask_5pct", np.zeros_like(closes))
+                atr = matrix.atr.copy() # Directly access known attributes
+                
+                # Futures Data
+                funding = matrix.funding_rate.copy()
+                oi = matrix.open_interest.copy()
+                bid_liq = matrix.liquidity_bid_5pct.copy()
+                ask_liq = matrix.liquidity_ask_5pct.copy()
+                
                 timestamps = matrix.timestamps[:, -1].copy()
                 symbols = matrix.symbols
             
@@ -119,21 +138,25 @@ class MarketEngine:
             valid_mask = (opens > 0)
             if not np.any(valid_mask):
                 continue
-                
+            
+            # Pct Change
             pct_changes = np.zeros_like(closes)
             np.divide((closes - opens), opens, out=pct_changes, where=valid_mask)
             pct_changes *= 100.0
 
-            # ATR-normalized move (how many ATRs the candle moved)
+            # ATR-normalized move
             price_range = np.abs(closes - opens)
             atr_norm = np.zeros_like(closes)
             np.divide(price_range, atr, out=atr_norm, where=(atr > 0))
 
             # --- 3. Boolean Logic Masks (ATR-aware) ---
+            # Pump: Price up + Big Move vs ATR
             mask_pump = (pct_changes >= pump_thr) & (atr_norm >= atr_min_moves)
+            
+            # Dump: Price down + Big Move vs ATR
             mask_dump = (pct_changes <= dump_thr) & (atr_norm >= atr_min_moves)
 
-            # Noise filter: Spike = strong volume + decent % move or strong ATR move
+            # Spike: Volume Spike + (Price Move OR ATR Move)
             mask_spike = (
                 (vol_z >= spike_thr) &
                 ((np.abs(pct_changes) >= 0.5) | (atr_norm >= atr_min_moves))
@@ -155,47 +178,49 @@ class MarketEngine:
                 a = float(atr[idx])
                 f = float(funding[idx])
                 oi_val = float(oi[idx])
-                bid_l = float(bid_liq[idx])
-                ask_l = float(ask_liq[idx])
+                liq_val = float(bid_liq[idx] + ask_liq[idx])
 
                 # Determine Type & Base Score
                 if mask_pump[idx]:
                     etype = 'PUMP'
                     score = 50.0 + (vz * 5.0)
-                    if r > 70:
-                        score += 10.0
+                    if r > 70: score += 10.0
                 elif mask_dump[idx]:
                     etype = 'DUMP'
                     score = 50.0 + (vz * 5.0)
-                    if r < 30:
-                        score += 10.0
+                    if r < 30: score += 10.0
                 else:
                     etype = 'SPIKE'
                     score = 40.0 + (vz * 5.0)
 
-                # --- Volatility confidence: ATR moves ---
+                # --- Scoring Factors ---
+                
+                # 1. Volatility confidence
                 if a > 0:
                     atr_moves = abs((closes[idx] - opens[idx]) / a)
                     score += min(atr_moves * 2.0, 15.0)
 
-                # --- Liquidity bonus: big moves with big ±5% liquidity ---
-                liq_total = bid_l + ask_l
-                if liq_total > 0:
-                    liq_score = min(liq_total / 1_000_000.0 * 5.0, 15.0)
+                # 2. Liquidity bonus (USDT value)
+                if liq_val > 0:
+                    # e.g. 5M liquidity adds 5 points, max 15
+                    liq_score = min(liq_val / 1_000_000.0 * 1.0, 15.0)
                     score += liq_score
 
-                # --- Funding bias: extreme funding in direction ---
-                if etype == 'PUMP' and f > 0:
-                    score += min(f * 50.0, 10.0)  # funding in %
-                elif etype == 'DUMP' and f < 0:
+                # 3. Funding bias
+                if etype == 'PUMP' and f > 0.01: # High positive funding = Bullish sentiment? or Overbought?
+                     # Usually high funding means longs paying shorts -> overcrowded. 
+                     # But for momentum, it implies strong demand.
+                    score += min(f * 50.0, 10.0)
+                elif etype == 'DUMP' and f < -0.01:
                     score += min(abs(f) * 50.0, 10.0)
 
-                # --- Open interest: larger OI => more meaningful ---
+                # 4. Open Interest
                 if oi_val > 0:
-                    oi_bonus = min(oi_val / 10_000_000.0 * 5.0, 10.0)
+                    # e.g. 50M OI adds 5 points
+                    oi_bonus = min(oi_val / 10_000_000.0 * 1.0, 10.0)
                     score += oi_bonus
 
-                # 🔥 SENSITIVITY BOOST 🔥
+                # 5. Hot Symbol Boost
                 boost = self.hot_symbols[sym] * 5.0
                 score += boost
 
@@ -219,11 +244,15 @@ class MarketEngine:
                     rsi=r,
                     score=int(score),
                     timestamp=ts,
-                    urgency=2 if score > 75 else 1
+                    urgency=2 if score > 75 else 1,
+                    funding_rate=f,
+                    oi_value=oi_val,
+                    liq_5pct=liq_val
                 ))
 
         # --- 6. Update History & LOGGING ---
         if new_events:
+            # Sort by score desc
             new_events.sort(key=lambda x: x.score, reverse=True)
             
             async with self.lock:
@@ -231,31 +260,25 @@ class MarketEngine:
                 if len(self.alerts_history) > self.max_history:
                     self.alerts_history = self.alerts_history[-self.max_history:]
             
-            # 1. Count alerts per timeframe
+            # Log Logic
             tf_counts = Counter(ev.timeframe for ev in new_events)
             tf_summary = ", ".join([f"{k}:{v}" for k, v in tf_counts.items()])
-            
-            # 2. Compact vs Detailed Log
             count_str = f"⚡ {len(new_events)} alerts [{tf_summary}]"
             
             if len(new_events) <= 5:
-                # One-liner mode
+                # One-liner
                 details = []
                 for ev in new_events:
                     icon = "🟢" if ev.type == "PUMP" else ("🔴" if ev.type == "DUMP" else "🟡")
-                    details.append(f"{icon} {ev.symbol} [{ev.timeframe}] {ev.change_pct:+.1f}%")
-                
+                    details.append(f"{icon} {ev.symbol} {ev.change_pct:+.1f}% ({ev.score})")
                 logger.info(f"{count_str}: {', '.join(details)}")
             else:
-                # Multiline mode for spam
+                # Compact Summary
                 logger.info(count_str)
-                for ev in new_events[:5]:
+                # Print top 3 only to avoid spamming
+                for ev in new_events[:3]:
                     icon = "🟢" if ev.type == "PUMP" else ("🔴" if ev.type == "DUMP" else "🟡")
-                    logger.info(
-                        f"   {icon} {ev.symbol} [{ev.timeframe}] {ev.type} "
-                        f"({ev.change_pct:+.2f}%) | Score: {ev.score}"
-                    )
-                logger.info(f"   ... and {len(new_events) - 5} others.")
+                    logger.info(f"   {icon} {ev.symbol} [{ev.timeframe}] {ev.type} {ev.change_pct:+.1f}% | Score: {ev.score}")
 
     def _should_alert(self, symbol, tf, score, now_ts) -> bool:
         state = self.signal_states[symbol][tf]
@@ -266,8 +289,10 @@ class MarketEngine:
         time_diff = now_ts - last_ts
         is_ready = False
         
+        # 1. Time Cooldown passed?
         if time_diff > cooldown:
             is_ready = True
+        # 2. Score Improvement? (Urgency Override)
         elif score > (last_score + 15.0):
             is_ready = True 
         
@@ -284,14 +309,15 @@ class MarketEngine:
         matrix = self.collector.matrices[timeframe]
         
         with matrix.lock:
+            # Fast references
             closes = matrix.closes[:, -1]
             opens = matrix.closes[:, -2]
             vols = matrix.volumes[:, -1]
             rsi = matrix.rsi
             vol_z = matrix.vol_z
-            atr = getattr(matrix, "atr", np.zeros_like(closes))
-            funding = getattr(matrix, "funding_rate", np.zeros_like(closes))
-            oi = getattr(matrix, "open_interest", np.zeros_like(closes))
+            atr = matrix.atr
+            funding = matrix.funding_rate
+            oi = matrix.open_interest
             symbols = matrix.symbols
         
         # Metric selection
@@ -305,6 +331,7 @@ class MarketEngine:
         elif sort_by == 'usdt_volume':
             metric = closes * vols
         elif sort_by == 'hot':
+            # Hot = High Vol Z-Score + RSI Extremes
             metric = np.abs(vol_z) * (np.abs(rsi - 50.0) / 50.0)
         elif sort_by == 'atr_move':
             price_range = np.abs(closes - opens)
@@ -314,16 +341,20 @@ class MarketEngine:
             metric = np.zeros_like(closes)
 
         n = len(metric)
-        if n == 0:
-            return []
+        if n == 0: return []
         limit = min(limit, n)
         
+        # Optimized sorting using argpartition (O(n) instead of O(n log n))
         if 'asc' in sort_by:
-            top_indices = np.argpartition(metric, limit)[:limit]
-            top_indices = top_indices[np.argsort(metric[top_indices])]
+            # Lowest first
+            unsorted_top = np.argpartition(metric, limit)[:limit]
+            # Sort the top k
+            top_indices = unsorted_top[np.argsort(metric[unsorted_top])]
         else:
-            top_indices = np.argpartition(metric, -limit)[-limit:]
-            top_indices = top_indices[np.argsort(metric[top_indices])[::-1]]
+            # Highest first
+            unsorted_top = np.argpartition(metric, -limit)[-limit:]
+            # Sort the top k descending
+            top_indices = unsorted_top[np.argsort(metric[unsorted_top])[::-1]]
 
         results = []
         for idx in top_indices:
@@ -344,7 +375,6 @@ class MarketEngine:
             })
             
         return results
-
 
 if __name__ == "__main__":
     pass
