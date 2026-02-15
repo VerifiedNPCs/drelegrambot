@@ -27,7 +27,7 @@ class Config:
 
     # Logging Settings
     LOG_LEVEL = "INFO"
-    LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s - %(message)s"
 
 # Create a single instance to be imported elsewhere
 config = Config()

@@ -2,7 +2,9 @@
 import asyncio
 import json
 import os
+import gc
 import logging
+import psutil
 import aiohttp
 import numpy as np
 import traceback
@@ -27,14 +29,14 @@ STABLECOINS = {
 # ==============================================================================
 # ⚡ NUMBA JIT ENGINE (Zero-Allocation Optimization)
 # ==============================================================================
-def env_flag(name: str, default: str = "false") -> bool:
+def env_flag(name: str, default: str = "true") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "y", "on")
 
 @njit(parallel=True, fastmath=True, cache=True)
 def calc_indicators_inplace(
     closes, volumes, highs, lows, 
-    out_rsi, out_mfi, out_adx, out_vol_z, 
-    period_rsi=14, period_mfi=14, period_adx=14
+    out_rsi, out_mfi, out_adx, out_vol_z, out_atr,
+    period_rsi=14, period_mfi=14, period_adx=14, period_atr=14
 ):
     """
     Writes results directly into pre-allocated output arrays.
@@ -151,6 +153,52 @@ def calc_indicators_inplace(
             out_vol_z[i] = (row_v[-1] - v_mean) / v_std
         else:
             out_vol_z[i] = 0.0
+
+        # --- 5. ATR Calculation (Wilder's Smoothing) ---
+        # First, calculate the initial SMA for the first period
+        start_atr = valid_start + 1
+        atr_val = 0.0
+        
+        # 1. Calculate SMA for the first 'period_atr' elements to seed the RMA
+        if n_cols - start_atr > period_atr:
+            tr_sum = 0.0
+            for j in range(start_atr, start_atr + period_atr):
+                high = row_h[j]
+                low = row_l[j]
+                prev_close = row_c[j-1]
+                
+                hl = high - low
+                hc = abs(high - prev_close)
+                lc = abs(low - prev_close)
+                
+                tr = hl
+                if hc > tr: tr = hc
+                if lc > tr: tr = lc
+                tr_sum += tr
+            
+            atr_val = tr_sum / period_atr
+
+            # 2. Apply Wilder's Smoothing (RMA) for the rest
+            for j in range(start_atr + period_atr, n_cols):
+                high = row_h[j]
+                low = row_l[j]
+                prev_close = row_c[j-1]
+                
+                hl = high - low
+                hc = abs(high - prev_close)
+                lc = abs(low - prev_close)
+                
+                tr = hl
+                if hc > tr: tr = hc
+                if lc > tr: tr = lc
+                
+                # ATR = ((Prior ATR * (n-1)) + Current TR) / n
+                atr_val = ((atr_val * (period_atr - 1)) + tr) / period_atr
+        
+        out_atr[i] = atr_val
+
+
+
 # ==============================================================================
 # 💀 LIQUIDATION MONITOR (Full History & Stats)
 # ==============================================================================
@@ -164,15 +212,8 @@ class LiquidationHistoryLoader:
          
     
     async def download_and_parse_day(self, session: aiohttp.ClientSession, date_str: str) -> int:
-        '''
-        Downloads a single day's liquidation file from Binance.
-        Returns number of liquidations loaded.
-        
-        URL format: https://data.binance.vision/data/futures/um/daily/liquidationSnapshot/BTCUSDT/BTCUSDT-liquidationSnapshot-2026-02-13.zip
-        '''
         loaded_count = 0
-        
-        # Process each symbol individually (Binance stores per-symbol files)
+
         for symbol in self.symbols:
             try:
                 filename = f"{symbol}-liquidationSnapshot-{date_str}.zip"
@@ -180,54 +221,45 @@ class LiquidationHistoryLoader:
 
                 async with session.get(url, timeout=30) as resp:
                     if resp.status == 404:
-                        # Symbol might not have liquidations that day or doesn't exist
                         continue
-
                     if resp.status != 200:
                         logger.warning(f"Failed to download {symbol} liq data for {date_str}: HTTP {resp.status}")
                         continue
 
-                    # Download ZIP file
                     zip_data = await resp.read()
 
-                    # Extract CSV from ZIP
-                    with zipfile.ZipFile(BytesIO(zip_data)) as z:
-                        csv_filename = f"{symbol}-liquidationSnapshot-{date_str}.csv"
+                with zipfile.ZipFile(BytesIO(zip_data)) as z:
+                    csv_filename = f"{symbol}-liquidationSnapshot-{date_str}.csv"
+                    if csv_filename not in z.namelist():
+                        continue
 
-                        if csv_filename not in z.namelist():
-                            continue
+                    with z.open(csv_filename) as csvfile:
+                        csv_content = csvfile.read().decode('utf-8')
+                        reader = csv.DictReader(StringIO(csv_content))
 
-                        with z.open(csv_filename) as csvfile:
-                            csv_content = csvfile.read().decode('utf-8')
-                            reader = csv.DictReader(StringIO(csv_content))
+                        for row in reader:
+                            try:
+                                ts = float(row['time']) / 1000.0
+                                sym = row['symbol']
+                                side = row['side']
+                                qty = float(row['original_quantity'])
+                                price = float(row['price'])
+                                usd_val = qty * price
 
-                            # Parse CSV rows
-                            # Expected columns: time,symbol,side,order_type,time_in_force,original_quantity,price,average_price,order_status,order_last_filled_quantity
-                            for row in reader:
-                                try:
-                                    ts = float(row['time']) / 1000.0  # Convert ms to seconds
-                                    sym = row['symbol']
-                                    side = row['side']  # BUY or SELL
-                                    qty = float(row['original_quantity'])
-                                    price = float(row['price'])
+                                with self.liq_monitor._lock:
+                                    self.liq_monitor.history.append((ts, sym, side, usd_val, price))
 
-                                    usd_val = qty * price
-
-                                    # Add to history (same format as WebSocket)    
-                                    with self.liq_monitor._lock:
-                                        self.liq_monitor.history.append((ts, sym, side, usd_val, price))
-
-                                    loaded_count += 1
-
-                                except (KeyError, ValueError, TypeError):
-                                    continue
+                                loaded_count += 1
+                            except (KeyError, ValueError, TypeError):
+                                continue
 
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout downloading {symbol} liq data for {date_str}")
             except Exception as e:
-                logger.debug(f"Error loading {symbol} liq for {date_str}: {e}")    
+                logger.debug(f"Error loading {symbol} liq for {date_str}: {e}")
 
         return loaded_count
+
 
 
     async def load_last_7_days(self):
@@ -407,33 +439,38 @@ class LiquidationMonitor:
         logger.debug(f"Liq stats recalculated: {len(self.history)} events in memory")
 
     def _process_event(self, data):
-        """Parses a single websocket message."""
         payload = data.get('o', {})
-        if not payload: return
+        if not payload:
+            return
 
-        # Extract Fields
-        symbol = payload.get('s')
-        side = payload.get('S') # SELL = Long Liquidated, BUY = Short Liquidated
-        qty = float(payload.get('q', 0))
-        price = float(payload.get('p', 0))
-        ts = float(data.get('o', {}).get('T', time.time() * 1000)) / 1000.0
-        
-        usd_val = qty * price
+        try:
+            symbol = payload.get('s')
+            side = payload.get('S')  # SELL = Long liq, BUY = Short liq
+            qty = float(payload.get('q', 0.0))
+            price = float(payload.get('p', 0.0))
+            ts = float(payload.get('T', time.time() * 1000)) / 1000.0
 
-        with self._lock:
-            # 1. Add to raw history
-            self.history.append((ts, symbol, side, usd_val, price))
-            
-            # 2. Update real-time stats immediately (Add only)
-            stats = self.symbol_stats[symbol]
-            stats["last_price"] = price
-            
-            if side == 'SELL':
-                stats["24h_long"] += usd_val
-                stats["1h_long"] += usd_val
-            else:
-                stats["24h_short"] += usd_val
-                stats["1h_short"] += usd_val
+            if not symbol or side not in ('BUY', 'SELL'):
+                return
+
+            usd_val = qty * price
+
+            with self._lock:
+                self.history.append((ts, symbol, side, usd_val, price))
+
+                stats = self.symbol_stats[symbol]
+                stats["last_price"] = price
+
+                if side == 'SELL':
+                    stats["24h_long"] += usd_val
+                    stats["1h_long"] += usd_val
+                else:
+                    stats["24h_short"] += usd_val
+                    stats["1h_short"] += usd_val
+
+        except Exception:
+            pass
+
 
     async def _cleanup_loop(self):
         """Runs every minute to remove old data (>24h) and re-calc windows."""
@@ -499,64 +536,119 @@ class MarketMatrix:
         self.max_candles = max_candles
         self.symbol_map = {sym: i for i, sym in enumerate(symbols)}
         
-
-        # ===== EXISTING ARRAYS (keep as-is) =====
+        # --- Memory Allocations ---
+        # 1. OHLCV (Standard Candles)
         self.closes = np.zeros((self.n_symbols, max_candles), dtype=np.float32)
         self.volumes = np.zeros((self.n_symbols, max_candles), dtype=np.float32)
         self.highs = np.zeros((self.n_symbols, max_candles), dtype=np.float32)
         self.lows = np.zeros((self.n_symbols, max_candles), dtype=np.float32)
         self.timestamps = np.zeros((self.n_symbols, max_candles), dtype=np.uint64)
         self.last_update_ts = np.zeros(self.n_symbols, dtype=np.uint64)
-        self.liquidity_bid_5pct = np.zeros(self.n_symbols, dtype=np.float32)
-        self.liquidity_ask_5pct = np.zeros(self.n_symbols, dtype=np.float32)
 
-        # Indicator Buffers (Pre-allocated)
+        # 2. Indicators (Computed In-Place)
         self.rsi = np.full(self.n_symbols, 50.0, dtype=np.float32)
         self.mfi = np.full(self.n_symbols, 50.0, dtype=np.float32)
         self.adx = np.zeros(self.n_symbols, dtype=np.float32)
+        self.atr = np.zeros(self.n_symbols, dtype=np.float32)
         self.vol_z = np.zeros(self.n_symbols, dtype=np.float32)
 
-        # ===== NEW: FUTURES DATA ARRAYS =====
-        # Funding Rate (updated every 8 hours)
+        # 3. Futures Data (Global Metrics)
         self.funding_rate = np.zeros(self.n_symbols, dtype=np.float32)
         self.next_funding_time = np.zeros(self.n_symbols, dtype=np.uint64)
-        
-        # Open Interest (USD value)
         self.open_interest = np.zeros(self.n_symbols, dtype=np.float32)
-
-        # Long/Short Ratios
-        self.long_short_ratio_accounts = np.zeros(self.n_symbols, dtype=np.float32)  # Top accounts
-        self.long_short_ratio_positions = np.zeros(self.n_symbols, dtype=np.float32)  # Top positions
-        self.long_short_ratio_global = np.zeros(self.n_symbols, dtype=np.float32)  # All traders
-
-        # Taker Buy/Sell Volume Ratio
+        self.long_short_ratio_accounts = np.zeros(self.n_symbols, dtype=np.float32)
+        self.long_short_ratio_positions = np.zeros(self.n_symbols, dtype=np.float32)
+        self.long_short_ratio_global = np.zeros(self.n_symbols, dtype=np.float32)
         self.taker_buy_sell_ratio = np.zeros(self.n_symbols, dtype=np.float32)
 
-        # Mark Price & Index Price
+        # 4. Mark Price & Index Price
         self.mark_price = np.zeros(self.n_symbols, dtype=np.float32)
         self.index_price = np.zeros(self.n_symbols, dtype=np.float32)
-
-        # Premium Index (Mark Price - Index Price) / Index Price 
         self.premium_index = np.zeros(self.n_symbols, dtype=np.float32)
 
-        # 24h Stats
-        self.price_change_24h = np.zeros(self.n_symbols, dtype=np.float32)  # % change
-        self.volume_24h = np.zeros(self.n_symbols, dtype=np.float32)  # USD volume
-        self.turnover_24h = np.zeros(self.n_symbols, dtype=np.float32)  # Quote asset volume
+        # 5. 24h Stats
+        self.price_change_24h = np.zeros(self.n_symbols, dtype=np.float32)
+        self.volume_24h = np.zeros(self.n_symbols, dtype=np.float32)
+        self.turnover_24h = np.zeros(self.n_symbols, dtype=np.float32)
+
+        # 6. Liquidity Depth (-5% / +5%)
+        self.liquidity_bid_5pct = np.zeros(self.n_symbols, dtype=np.float32)
+        self.liquidity_ask_5pct = np.zeros(self.n_symbols, dtype=np.float32)
+        self.liquidity_bid_bins = np.zeros((self.n_symbols, 20), dtype=np.float32)
+        self.liquidity_ask_bins = np.zeros((self.n_symbols, 20), dtype=np.float32)
 
         self.lock = threading.Lock()
+        self.last_calc_time = time.time()
 
+    def update_candle(self, symbol, close, volume, high, low, ts_ms: int, is_closed: bool):
+        idx = self.symbol_map.get(symbol)
+        if idx is None: return
 
-    # ADD this helper method to update futures data
+        # Constants for gap detection
+        # (Move these to class constants if you prefer)
+        TF_MS = {
+            '1m': 60000, '5m': 300000, '15m': 900000, 
+            '1h': 3600000, '4h': 14400000, '1d': 86400000
+        }
+        interval = TF_MS.get(self.timeframe, 60000)
+        pos = self.max_candles - 1
+
+        with self.lock:
+            # 1. Gap Detection Logic
+            last_ts = int(self.timestamps[idx, pos])
+            
+            if last_ts > 0 and ts_ms > (last_ts + interval * 1.5):
+                # Detected a gap larger than 1.5x interval
+                missed_count = int((ts_ms - last_ts) // interval) - 1
+                
+                # Limit fills to 5 candles max to prevent freezing
+                fill_count = min(missed_count, 5)
+
+                if fill_count > 0:
+                    prev_close = self.closes[idx, pos]
+                    
+                    # Fill gaps with flat candles (Doji)
+                    for k in range(fill_count):
+                        # Shift history left
+                        self.closes[idx, :-1] = self.closes[idx, 1:]
+                        self.volumes[idx, :-1] = self.volumes[idx, 1:]
+                        self.highs[idx, :-1] = self.highs[idx, 1:]
+                        self.lows[idx, :-1] = self.lows[idx, 1:]
+                        self.timestamps[idx, :-1] = self.timestamps[idx, 1:]
+                        
+                        # Insert Ghost Candle at end
+                        ghost_ts = last_ts + (interval * (k + 1))
+                        self.closes[idx, pos] = prev_close
+                        self.volumes[idx, pos] = 0.0  # Zero volume for gaps
+                        self.highs[idx, pos] = prev_close
+                        self.lows[idx, pos] = prev_close
+                        self.timestamps[idx, pos] = ghost_ts
+
+            # 2. Standard Update Logic
+            self.closes[idx, pos] = close
+            self.volumes[idx, pos] = volume
+            self.highs[idx, pos] = high
+            self.lows[idx, pos] = low
+            
+            if ts_ms:
+                self.timestamps[idx, pos] = np.uint64(ts_ms)
+                self.last_update_ts[idx] = np.uint64(ts_ms)
+
+            if is_closed:
+                # Shift for next candle
+                self.closes[idx, :-1] = self.closes[idx, 1:]
+                self.volumes[idx, :-1] = self.volumes[idx, 1:]
+                self.highs[idx, :-1] = self.highs[idx, 1:]
+                self.lows[idx, :-1] = self.lows[idx, 1:]
+                self.timestamps[idx, :-1] = self.timestamps[idx, 1:]
+
+                # Initialize new candle with current values
+                self.closes[idx, pos] = close
+                self.volumes[idx, pos] = 0.0
+                self.highs[idx, pos] = high
+                self.lows[idx, pos] = low
+
     def update_futures_data(self, symbol: str, data_type: str, value: float, extra_data: dict = None):
-        '''
-        Thread-safe update for futures metrics.
-
-        data_type can be: 'funding_rate', 'open_interest', 'long_short_accounts',
-                         'volume_24h', 'turnover_24h'
-                         'volume_24h', 'turnover_24h'
-                         'volume_24h', 'turnover_24h'
-        '''
         idx = self.symbol_map.get(symbol)
         if idx is None:
             return
@@ -599,42 +691,29 @@ class MarketMatrix:
 
             elif data_type == 'turnover_24h':
                 self.turnover_24h[idx] = value
-                
+
             elif data_type == 'liquidity_5pct':
-                # value is bid_liquidity, extra_data is {'ask': ask_liquidity}
+                # value is total bid liquidity in USDT
                 self.liquidity_bid_5pct[idx] = value
-                if extra_data and 'ask' in extra_data:
-                    self.liquidity_ask_5pct[idx] = float(extra_data['ask'])
+
+                if extra_data:
+                    ask_val = extra_data.get('ask')
+                    if ask_val is not None:
+                        self.liquidity_ask_5pct[idx] = float(ask_val)
+
+                    bid_bins = extra_data.get('bid_bins')
+                    if bid_bins is not None:
+                        arr = np.asarray(bid_bins, dtype=np.float32)
+                        if arr.shape[0] == self.liquidity_bid_bins.shape[1]:
+                            self.liquidity_bid_bins[idx] = arr
+
+                    ask_bins = extra_data.get('ask_bins')
+                    if ask_bins is not None:
+                        arr = np.asarray(ask_bins, dtype=np.float32)
+                        if arr.shape[0] == self.liquidity_ask_bins.shape[1]:
+                            self.liquidity_ask_bins[idx] = arr
 
 
-    def update_candle(self, symbol, close, volume, high, low, ts_ms: int, is_closed: bool):
-        idx = self.symbol_map.get(symbol)
-        if idx is None: return
-        pos = self.max_candles - 1
-
-        with self.lock:
-            # Atomic write
-            self.closes[idx, pos] = close
-            self.volumes[idx, pos] = volume
-            self.highs[idx, pos] = high
-            self.lows[idx, pos] = low
-            if ts_ms:
-                self.timestamps[idx, pos] = np.uint64(ts_ms)
-                self.last_update_ts[idx] = np.uint64(ts_ms)
-
-            if is_closed:
-                # Optimized Shift
-                self.closes[idx, :-1] = self.closes[idx, 1:]
-                self.volumes[idx, :-1] = self.volumes[idx, 1:]
-                self.highs[idx, :-1] = self.highs[idx, 1:]
-                self.lows[idx, :-1] = self.lows[idx, 1:]
-                self.timestamps[idx, :-1] = self.timestamps[idx, 1:]
-
-                # Reset new candle
-                self.closes[idx, pos] = close
-                self.volumes[idx, pos] = 0.0
-                self.highs[idx, pos] = high
-                self.lows[idx, pos] = low
 
     def get_analysis(self):
         """Returns a DICT of all analysis including futures data for the bot to read instantly."""
@@ -678,6 +757,7 @@ class MarketMatrix:
                     'rsi': float(rsi_copy[i]),
                     'mfi': float(mfi_copy[i]),
                     'adx': float(adx_copy[i]),
+                    'atr': float(self.atr[i]),
                     'vol_z': float(vol_z_copy[i]),
 
                     # Futures data
@@ -697,50 +777,74 @@ class MarketMatrix:
                     'liquidity_ask_5pct': float(ask_liq_copy[i]),
                 }
         return results
+    
+    def check_and_fill_gaps(self):
+        """
+        Active Health Check: Scans for symbols that have stopped updating.
+        If a symbol is silent for > 2 intervals, it force-fills the gap.
+        """
+        # 1. Determine timeframe in milliseconds
+        TF_MS = {
+            '1m': 60000, '5m': 300000, '15m': 900000, 
+            '1h': 3600000, '4h': 14400000, '1d': 86400000
+        }
+        interval = TF_MS.get(self.timeframe)
+        if not interval: return
+
+        now = int(time.time() * 1000)
+        pos = self.max_candles - 1
+        
+        with self.lock:
+            # Vectorized check: Find all indices where (now - last_update) > 2.5 * interval
+            # We use 2.5x to be generous and avoid race conditions with live updates
+            time_diffs = now - self.last_update_ts
+            
+            # Find stale indices where timestamp > 0 (avoid newly added symbols)
+            stale_indices = np.where((time_diffs > (interval * 2.5)) & (self.last_update_ts > 0))[0]
+            
+            if len(stale_indices) == 0:
+                return
+            
+            # Iterate through stale symbols and fill gaps
+            for idx in stale_indices:
+                last_ts = int(self.timestamps[idx, pos])
+                
+                # Double check inside the loop
+                if last_ts == 0: continue
+                
+                # Calculate missed candles
+                missed = int((now - last_ts) // interval)
+                
+                # Cap fills to 10 to prevent massive loops on dead coins
+                fill_count = min(missed, 10)
+                
+                if fill_count > 0:
+                    prev_close = self.closes[idx, pos]
+                    
+                    for k in range(fill_count):
+                        # Shift arrays
+                        self.closes[idx, :-1] = self.closes[idx, 1:]
+                        self.volumes[idx, :-1] = self.volumes[idx, 1:]
+                        self.highs[idx, :-1] = self.highs[idx, 1:]
+                        self.lows[idx, :-1] = self.lows[idx, 1:]
+                        self.timestamps[idx, :-1] = self.timestamps[idx, 1:]
+                        
+                        # Insert Ghost Candle
+                        ghost_ts = last_ts + (interval * (k + 1))
+                        self.closes[idx, pos] = prev_close
+                        self.volumes[idx, pos] = 0.0
+                        self.highs[idx, pos] = prev_close
+                        self.lows[idx, pos] = prev_close
+                        self.timestamps[idx, pos] = ghost_ts
+                        
+                        # IMPORTANT: Update last_update_ts so we don't re-fill next loop
+                        self.last_update_ts[idx] = ghost_ts
+
+
 
 # ==============================================================================
 # 📘 FUTURES DEPTH CACHE (With Memory Cleanup)
 # ==============================================================================
-
-class _DepthBook:
-    __slots__ = ("bids", "asks", "max_levels", "last_event_ms", "last_access")
-    def __init__(self, max_levels=20):
-        self.bids = {}; self.asks = {}
-        self.max_levels = max_levels
-        self.last_event_ms = 0
-        self.last_access = time.time()
-
-    def touch(self): self.last_access = time.time()
-
-    def seed_from_snapshot(self, bids, asks):
-        self.bids.clear(); self.asks.clear()
-        for p, q in bids: self.bids[float(p)] = float(q)
-        for p, q in asks: self.asks[float(p)] = float(q)
-        self._trim(); self.touch()
-
-    def apply_updates(self, b_upd, a_upd, event_ms):
-        for p, q in b_upd:
-            fp, fq = float(p), float(q)
-            if fq <= 0: self.bids.pop(fp, None)
-            else: self.bids[fp] = fq
-        for p, q in a_upd:
-            fp, fq = float(p), float(q)
-            if fq <= 0: self.asks.pop(fp, None)
-            else: self.asks[fp] = fq
-        if event_ms: self.last_event_ms = int(event_ms)
-        self._trim()
-
-    def _trim(self):
-        keep = 60
-        if len(self.bids) > keep:
-            for p in sorted(self.bids.keys())[:-keep]: self.bids.pop(p, None)
-        if len(self.asks) > keep:
-            for p in sorted(self.asks.keys())[keep:]: self.asks.pop(p, None)
-
-    def top_levels(self):
-        bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[: self.max_levels]
-        asks = sorted(self.asks.items(), key=lambda x: x[0])[: self.max_levels]
-        return bids, asks
 
 class FuturesDataCollector:
     """
@@ -929,13 +1033,9 @@ class FuturesDataCollector:
 
 
     async def websocket_24h_ticker(self):
-        """
-        WebSocket stream for 24h ticker statistics (ALL symbols in 1 stream).
-        Provides real-time price change, volume, turnover.
-        """
-        url = f"{self.fapi_ws}/!ticker@arr"  # ← OPTIMIZED: Single aggregate stream
-
+        url = f"{self.fapi_ws}/!ticker@arr"
         backoff = 1.0
+
         while self.running:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -950,26 +1050,21 @@ class FuturesDataCollector:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
                                     data = json.loads(msg.data)
-
-                                    # Data is now an ARRAY of tickers
                                     if isinstance(data, list):
                                         for ticker in data:
                                             symbol = ticker.get('s')
-
-                                            # Filter only our symbols
                                             if symbol not in self.symbols:
                                                 continue
 
-                                            price_change_pct = float(ticker.get('P', 0))
-                                            volume = float(ticker.get('v', 0))
-                                            quote_volume = float(ticker.get('q', 0))
+                                            price_change_pct = float(ticker.get('P', 0.0))
+                                            volume = float(ticker.get('v', 0.0))
+                                            quote_volume = float(ticker.get('q', 0.0))
 
                                             for matrix in self.matrices.values():
                                                 matrix.update_futures_data(symbol, 'price_change_24h', price_change_pct)
-                                                matrix.update_futures_data(symbol, 'volume_24h', volume)   
+                                                matrix.update_futures_data(symbol, 'volume_24h', volume)
                                                 matrix.update_futures_data(symbol, 'turnover_24h', quote_volume)
-
-                                except:
+                                except Exception:
                                     pass
 
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -981,14 +1076,12 @@ class FuturesDataCollector:
                 backoff *= 1.5
 
 
-    async def websocket_mark_price(self):
-        """
-        WebSocket stream for mark price updates (ALL symbols in 1 stream).
-        Updates every 3 seconds.
-        """
-        url = f"{self.fapi_ws}/!markPrice@arr@1s"  # ← OPTIMIZED: Single aggregate stream
 
+
+    async def websocket_mark_price(self):
+        url = f"{self.fapi_ws}/!markPrice@arr@1s"
         backoff = 1.0
+
         while self.running:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -1003,35 +1096,30 @@ class FuturesDataCollector:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
                                     data = json.loads(msg.data)
-
-                                    # Data is now an ARRAY of mark prices
                                     if isinstance(data, list):
                                         for item in data:
                                             symbol = item.get('s')
-
-                                            # Filter only our symbols
                                             if symbol not in self.symbols:
                                                 continue
 
-                                            mark_price = float(item.get('p', 0))
-                                            index_price = float(item.get('i', 0))
-                                            funding_rate = float(item.get('r', 0)) * 100
+                                            mark_price = float(item.get('p', 0.0))
+                                            index_price = float(item.get('i', 0.0))
+                                            funding_rate = float(item.get('r', 0.0)) * 100.0
                                             next_funding = int(item.get('T', 0))
 
-                                            # Calculate premium
-                                            if index_price > 0:
-                                                premium = ((mark_price - index_price) / index_price) * 100 
-                                            else:
-                                                premium = 0.0
+                                            premium = 0.0
+                                            if index_price > 0.0:
+                                                premium = ((mark_price - index_price) / index_price) * 100.0
 
                                             for matrix in self.matrices.values():
                                                 matrix.update_futures_data(symbol, 'mark_price', mark_price)
                                                 matrix.update_futures_data(symbol, 'index_price', index_price)
                                                 matrix.update_futures_data(symbol, 'premium_index', premium)
-                                                matrix.update_futures_data(symbol, 'funding_rate', funding_rate,
-                                                                         {'next_funding_time': next_funding})
-
-                                except:
+                                                matrix.update_futures_data(
+                                                    symbol, 'funding_rate', funding_rate,
+                                                    {'next_funding_time': next_funding}
+                                                )
+                                except Exception:
                                     pass
 
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -1041,8 +1129,6 @@ class FuturesDataCollector:
                 logger.error(f"Mark Price WS error: {e}")
                 await asyncio.sleep(min(backoff, 60))
                 backoff *= 1.5
-
-
 
     async def periodic_rest_updates(self):
         """
@@ -1073,11 +1159,11 @@ class FuturesDataCollector:
         """
         logger.info("📊 Futures Data Collector Starting...")
 
-        # Initial fetch
+        # Initial fetch (BLOCKING!)
         await self.fetch_funding_rates()
         await self.fetch_open_interest()
 
-        # Start all tasks
+        # Start all tasks (ONLY REACHED AFTER ABOVE RETURNS)
         tasks = [
             asyncio.create_task(self.websocket_24h_ticker()),
             asyncio.create_task(self.websocket_mark_price()),
@@ -1086,12 +1172,6 @@ class FuturesDataCollector:
 
         await asyncio.gather(*tasks)
 class DepthLiquidityCollector:
-    """
-    Calculates total liquidity (USDT value) within ±5% of mid price.
-    Uses periodic REST snapshots (limit=1000) to ensure full depth coverage.
-    Updates each symbol approx once per minute to respect weight limits.
-    """
-
     def __init__(self, symbols: List[str], matrices: Dict[str, MarketMatrix]):
         self.symbols = [s.upper() for s in symbols]
         self.matrices = matrices
@@ -1099,17 +1179,10 @@ class DepthLiquidityCollector:
         self.fapi_base = "https://fapi.binance.com/fapi/v1"
         self.rate_limit_weight = 10  # Weight for limit=1000
         self.max_weight_per_min = 2400
-
-        # Calculate safe delay between requests
-        # Target: 150 symbols * 10 weight = 1500 weight/min (Safe)
-        # 60 seconds / 150 symbols = 0.4s delay
         self.request_delay = 60.0 / max(len(self.symbols), 1)
 
 
     async def fetch_and_calculate_depth(self, session, symbol):
-        """
-        Fetches full depth (limit=1000) and sums liquidity within ±5%.
-        """
         try:
             url = f"{self.fapi_base}/depth"
             params = {"symbol": symbol, "limit": 1000}
@@ -1119,11 +1192,9 @@ class DepthLiquidityCollector:
                     data = await resp.json()
                     bids = data.get('bids', [])
                     asks = data.get('asks', [])
-
                     if not bids or not asks:
                         return
 
-                    # Calculate Mid Price
                     best_bid = float(bids[0][0])
                     best_ask = float(asks[0][0])
                     mid_price = (best_bid + best_ask) / 2.0
@@ -1131,63 +1202,82 @@ class DepthLiquidityCollector:
                     lower_bound = mid_price * 0.95
                     upper_bound = mid_price * 1.05
 
-                    # Sum Bids (Buy Liquidity) down to -5%
-                    bid_liquidity = 0.0
+                    bid_bins = np.zeros(20, dtype=np.float32)
+                    ask_bins = np.zeros(20, dtype=np.float32)
+
+                    # Bids: from mid downwards
                     for p_str, q_str in bids:
                         price = float(p_str)
                         if price < lower_bound:
-                            break  # Out of range
+                            break  # Out of range (-5%)
                         qty = float(q_str)
-                        bid_liquidity += price * qty
+                        dist_pct = ((mid_price - price) / mid_price) * 100.0
+                        bin_idx = int(dist_pct / 0.25)
+                        if 0 <= bin_idx < 20:
+                            bid_bins[bin_idx] += price * qty
 
-                    # Sum Asks (Sell Liquidity) up to +5%
-                    ask_liquidity = 0.0
+                    # Asks: from mid upwards
                     for p_str, q_str in asks:
                         price = float(p_str)
                         if price > upper_bound:
-                            break  # Out of range
+                            break  # Out of range (+5%)
                         qty = float(q_str)
-                        ask_liquidity += price * qty
+                        dist_pct = ((price - mid_price) / mid_price) * 100.0
+                        bin_idx = int(dist_pct / 0.25)
+                        if 0 <= bin_idx < 20:
+                            ask_bins[bin_idx] += price * qty
 
-                    # Update Matrices
+                    total_bid_liquidity = float(np.sum(bid_bins))
+                    total_ask_liquidity = float(np.sum(ask_bins))
+
+                    extra_data = {
+                        'ask': total_ask_liquidity,
+                        'bid_bins': bid_bins,
+                        'ask_bins': ask_bins,
+                    }
+
                     for matrix in self.matrices.values():
-                        matrix.update_futures_data(symbol, 'liquidity_5pct', bid_liquidity, {'ask': ask_liquidity})
+                        matrix.update_futures_data(
+                            symbol,
+                            'liquidity_5pct',
+                            total_bid_liquidity,
+                            extra_data
+                        )
 
                 elif resp.status == 429:
-                    logger.warning(f"DepthCollector: Rate limit hit (429). slowing down...")
+                    logger.warning(f"DepthCollector: Rate limit hit (429) for {symbol}, slowing down...")
                     await asyncio.sleep(5)
 
         except Exception as e:
-            # logger.debug(f"Depth calc error for {symbol}: {e}")
-            pass
+            logger.debug(f"Depth calc error for {symbol}: {e}")
+
 
 
     async def run(self):
-        """
-        Main loop: Rotates through symbols and fetches snapshots.
-        """
-        logger.info(f"💧 Depth Liquidity Collector Started ({len(self.symbols)} symbols, ~60s cycle)")  
+        if self.symbols:
+            self.request_delay = 60.0 / max(len(self.symbols), 1)
+            
+        logger.info(f"💧 Depth Liquidity Collector Started ({len(self.symbols)} symbols, ~{self.request_delay:.2f}s delay)")
 
-        while self.running:
-            # Create session for the batch
-            async with aiohttp.ClientSession() as session:
-                for symbol in self.symbols:
+        connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            while self.running:
+                current_symbols = list(self.symbols)
+                
+                for symbol in current_symbols:
                     if not self.running: break
-
-                    # Fire and forget (or await if strict timing needed)
-                    # We await to enforce strict rate limiting pacing
                     await self.fetch_and_calculate_depth(session, symbol)
-
+                    
+                    if current_symbols:
+                        count = len(current_symbols)
+                        # Ensure we don't go too fast (max 2300 weight/min)
+                        safe_delay = 60.0 / (2300 / 10)  # ~0.26s minimum
+                        target_delay = 60.0 / max(count, 1)
+                        self.request_delay = max(target_delay, safe_delay)
+                    
                     await asyncio.sleep(self.request_delay)
 
-            # Recalculate delay in case symbol count changed
-            if self.symbols:
-                self.request_delay = 60.0 / max(len(self.symbols), 1)
-
-
-# ==============================================================================
-# 📡 DATA COLLECTOR (Full Logic)
-# ==============================================================================
 
 class BinanceMarketDataCollector:
     def __init__(self):
@@ -1212,33 +1302,27 @@ class BinanceMarketDataCollector:
         target_usdt: float = 0,  # Unused now, kept for compatibility
         mid_price: Optional[float] = None
     ) -> Optional[Dict[str, float]]:
-        """
-        Accessor for Telegram Bot to get ±5% liquidity.
-        Reads directly from MarketMatrix (Thread-Safe).
-        """
-        # 1. Get the 1m matrix (contains latest data)
         matrix = self.matrices.get('1m')
         if not matrix:
             return None
             
-        # 2. Find symbol index
         idx = matrix.symbol_map.get(symbol)
         if idx is None:
             return None
             
-        # 3. Read values safely
         with matrix.lock:
             bid_liq = float(matrix.liquidity_bid_5pct[idx])
             ask_liq = float(matrix.liquidity_ask_5pct[idx])
             price = float(matrix.closes[idx, -1])
             
-        # 4. Return formatted dict
         return {
             "symbol": symbol,
             "mid_price": price,
             "bid_liquidity_5pct": bid_liq,
             "ask_liquidity_5pct": ask_liq,
-            "total_liquidity_5pct": bid_liq + ask_liq
+            "total_liquidity_5pct": bid_liq + ask_liq,
+            "bid_bins": matrix.liquidity_bid_bins[idx].tolist(),  # Convert to list for JSON/Bot
+            "ask_bins": matrix.liquidity_ask_bins[idx].tolist()
         }
     
     def get_liq_stats(self, symbol: str) -> dict:
@@ -1246,41 +1330,27 @@ class BinanceMarketDataCollector:
         return self.liq_monitor.get_liquidation_data(symbol)
     
     async def fetch_top_coins(self):
-        """
-        Fetches top 100 coins by 24h volume (USDT pairs only).
-        Excludes stablecoins from base assets.
-        """
         url = f"{self.api_url}/ticker/24hr"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=10) as r:
                     data = await r.json()
 
-                    # Filter: Must end with USDT AND base asset NOT a stablecoin
                     usdt_pairs = []
                     for ticker in data:
                         symbol = ticker.get('symbol', '')
 
-                        # Check if ends with USDT
                         if not symbol.endswith('USDT'):
                             continue
-
-                        # Extract base asset (e.g., BTC from BTCUSDT)
                         base_asset = symbol[:-4]  # Remove 'USDT'
-
-                        # Skip if base is a stablecoin
                         if base_asset in STABLECOINS:
                             continue
-
                         usdt_pairs.append(ticker)
 
-                    # Sort by 24h quote volume (USDT volume)
                     usdt_pairs.sort(key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)
 
-                    # Take top 100
-                    new_top_coins = [x['symbol'] for x in usdt_pairs[:165]]        
+                    new_top_coins = [x['symbol'] for x in usdt_pairs[:170]]        
 
-                    # Log changes if list updated
                     if self.top_coins:
                         old_set = set(self.top_coins)
                         new_set = set(new_top_coins)
@@ -1306,7 +1376,7 @@ class BinanceMarketDataCollector:
 
     async def load_state(self):
         """Restores state from disk."""
-        loaded = False
+        loaded = True
         try:
             for tf in self.active_timeframes:
                 # FIX: Handle Windows case-insensitivity
@@ -1339,77 +1409,98 @@ class BinanceMarketDataCollector:
         Called when symbol list changes.
         Preserves data for existing symbols, adds new ones.
         """
+        new_symbols = self.top_coins
+
         for tf in self.active_timeframes:
+            # If matrix for this TF doesn't exist yet, just create it fresh
             if tf not in self.matrices:
-                # First time - create new matrix
-                self.matrices[tf] = MarketMatrix(self.top_coins, tf)
+                self.matrices[tf] = MarketMatrix(new_symbols, tf)
                 continue
 
             old_matrix = self.matrices[tf]
             old_symbols = old_matrix.symbols
 
-            # Check if symbols changed
-            if set(old_symbols) == set(self.top_coins):
-                continue  # No change needed
+            # No change needed
+            if set(old_symbols) == set(new_symbols):
+                continue
 
-            # Create new matrix with updated symbols
-            new_matrix = MarketMatrix(self.top_coins, tf, old_matrix.max_candles)  
+            # Create new matrix with updated symbols, same candle depth
+            new_matrix = MarketMatrix(new_symbols, tf, old_matrix.max_candles)
 
-            # Copy data for symbols that exist in both old and new
-            for new_idx, symbol in enumerate(self.top_coins):
-                if symbol in old_matrix.symbol_map:
-                    old_idx = old_matrix.symbol_map[symbol]
+            # Copy data for overlapping symbols
+            for new_idx, symbol in enumerate(new_symbols):
+                old_idx = old_matrix.symbol_map.get(symbol)
+                if old_idx is None:
+                    continue
 
-                    with old_matrix.lock:
-                        new_matrix.closes[new_idx] = old_matrix.closes[old_idx].copy()
-                        new_matrix.volumes[new_idx] = old_matrix.volumes[old_idx].copy()
-                        new_matrix.highs[new_idx] = old_matrix.highs[old_idx].copy()
-                        new_matrix.lows[new_idx] = old_matrix.lows[old_idx].copy() 
-                        new_matrix.timestamps[new_idx] = old_matrix.timestamps[old_idx].copy()
+                with old_matrix.lock:
+                    new_matrix.closes[new_idx] = old_matrix.closes[old_idx]
+                    new_matrix.volumes[new_idx] = old_matrix.volumes[old_idx]
+                    new_matrix.highs[new_idx] = old_matrix.highs[old_idx]
+                    new_matrix.lows[new_idx] = old_matrix.lows[old_idx]
+                    new_matrix.timestamps[new_idx] = old_matrix.timestamps[old_idx]
+                    new_matrix.rsi[new_idx] = old_matrix.rsi[old_idx]
+                    new_matrix.mfi[new_idx] = old_matrix.mfi[old_idx]
+                    new_matrix.adx[new_idx] = old_matrix.adx[old_idx]
+                    new_matrix.atr[new_idx] = old_matrix.atr[old_idx]
+                    new_matrix.vol_z[new_idx] = old_matrix.vol_z[old_idx]
 
-            # Replace old matrix
+                    # Futures / liquidity fields (safe to copy as-is)
+                    new_matrix.funding_rate[new_idx] = old_matrix.funding_rate[old_idx]
+                    new_matrix.next_funding_time[new_idx] = old_matrix.next_funding_time[old_idx]
+                    new_matrix.open_interest[new_idx] = old_matrix.open_interest[old_idx]
+                    new_matrix.long_short_ratio_accounts[new_idx] = old_matrix.long_short_ratio_accounts[old_idx]
+                    new_matrix.long_short_ratio_positions[new_idx] = old_matrix.long_short_ratio_positions[old_idx]
+                    new_matrix.long_short_ratio_global[new_idx] = old_matrix.long_short_ratio_global[old_idx]
+                    new_matrix.taker_buy_sell_ratio[new_idx] = old_matrix.taker_buy_sell_ratio[old_idx]
+                    new_matrix.mark_price[new_idx] = old_matrix.mark_price[old_idx]
+                    new_matrix.index_price[new_idx] = old_matrix.index_price[old_idx]
+                    new_matrix.premium_index[new_idx] = old_matrix.premium_index[old_idx]
+                    new_matrix.price_change_24h[new_idx] = old_matrix.price_change_24h[old_idx]
+                    new_matrix.volume_24h[new_idx] = old_matrix.volume_24h[old_idx]
+                    new_matrix.turnover_24h[new_idx] = old_matrix.turnover_24h[old_idx]
+                    new_matrix.liquidity_bid_5pct[new_idx] = old_matrix.liquidity_bid_5pct[old_idx]
+                    new_matrix.liquidity_ask_5pct[new_idx] = old_matrix.liquidity_ask_5pct[old_idx]
+                    new_matrix.liquidity_bid_bins[new_idx] = old_matrix.liquidity_bid_bins[old_idx]
+                    new_matrix.liquidity_ask_bins[new_idx] = old_matrix.liquidity_ask_bins[old_idx]
+
+            # Atomically swap matrix reference
             self.matrices[tf] = new_matrix
-            logger.info(f"🔄 Rebuilt matrix for {tf}")
+            del old_matrix
+            gc.collect()
+            logger.info(f"🔄 Rebuilt matrix for {tf} (symbols: {len(new_symbols)}) | Memory Cleaned")
 
 
     async def symbol_refresh_task(self):
-        """
-        Refreshes top 100 list every hour.
-        Updates matrices and depth watchlists automatically.
-        """
         logger.info("🔄 Symbol Auto-Refresh Task Started (runs every 1 hour)")     
 
         while self.running:
             await asyncio.sleep(3600)  # 1 hour
-
             try:
-                old_symbols = set(self.top_coins) if self.top_coins else set()     
-
-                # Fetch new top 100
-                await self.top_coins()
-
+                old_symbols = set(self.top_coins) if self.top_coins else set()
+                await self.fetch_top_coins()
                 new_symbols = set(self.top_coins)
 
-                # If changed, rebuild
                 if old_symbols != new_symbols:
                     logger.info("📊 Symbol list changed - rebuilding matrices...") 
                     await self._rebuild_matrices_for_new_symbols()
 
                     # Update depth manager watchlist
-                    await self.set_depth_watchlist(self.top_coins)
+                    if self.depth_liquidity_collector:
+                        self.depth_liquidity_collector.symbols = list(self.top_coins)
 
                     logger.info("✅ Symbol refresh complete")
                 else:
                     logger.debug("Symbol list unchanged")
-
             except Exception as e:
                 logger.error(f"Symbol refresh failed: {e}")
                 await asyncio.sleep(300)  # Retry in 5 min on error
 
+
     async def fetch_historical_snapshot(self):
         """Fills the matrix with initial history."""
         logger.info("Fetching historical snapshot (Warmup)...")
-        concurrency = 15
+        concurrency = 50
         sem = asyncio.Semaphore(concurrency)
         timeout = aiohttp.ClientTimeout(total=30, sock_connect=5)
         connector = aiohttp.TCPConnector(limit=60, ttl_dns_cache=300)
@@ -1470,65 +1561,119 @@ class BinanceMarketDataCollector:
     async def _single_futures_kline_handler(self, streams: List[str], ws_id: int):
         url = f"{self.spot_ws_base}/stream?streams=" + "/".join(streams)
         backoff = 1.0
+
         while self.running:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(url, heartbeat=20) as ws:
-                        logger.info(f"WS-{ws_id}: Connected")
+                        logger.info(f"WS-{ws_id}: Connected ({len(streams)} streams)")
                         backoff = 1.0
+
                         async for msg in ws:
-                            if not self.running: break
+                            if not self.running:
+                                break
+
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
                                     payload = json.loads(msg.data)
                                     data = payload.get("data", payload)
                                     if data.get('e') == 'kline':
                                         self._process_kline(data)
-                                except Exception: pass
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
-            except Exception:
+                                except Exception as e:
+                                    logger.debug(f"WS-{ws_id} parse error: {e}")
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+
+            except Exception as e:
+                logger.error(f"WS-{ws_id} connection error: {e}")
                 await asyncio.sleep(min(backoff, 60))
                 backoff *= 1.5
 
-    def _process_kline(self, data):
+
+    def _process_kline(self, data: dict):
         try:
-            k = data['k']; tf = k['i']
-            if tf not in self.matrices: return
-            self.matrices[tf].update_candle(
-                data['s'], float(k['c']), float(k['v']), float(k['h']), float(k['l']),
-                int(k['t']), bool(k['x'])
-            )
-        except Exception: pass
+            k = data.get('k')
+            if not k:
+                return
+
+            tf = k.get('i')
+            symbol = data.get('s')
+            if not tf or not symbol:
+                return
+
+            matrix = self.matrices.get(tf)
+            if matrix is None:
+                return
+
+            close = float(k.get('c', 0.0))
+            volume = float(k.get('v', 0.0))
+            high = float(k.get('h', 0.0))
+            low = float(k.get('l', 0.0))
+            ts_ms = int(k.get('t', 0))
+            is_closed = bool(k.get('x', False))
+
+            matrix.update_candle(symbol, close, volume, high, low, ts_ms, is_closed)
+
+        except Exception as e:
+            logger.debug(f"_process_kline error: {e}")
+
 
     def _update_indicators_job(self, matrix: MarketMatrix):
-        """Runs in ThreadPool."""
+        """
+        Runs in ThreadPool.
+        Reads snapshot of OHLCV under lock, then computes indicators in-place.
+        """
         try:
+            # Take snapshot under lock to avoid partial writes
             with matrix.lock:
-                c = np.ascontiguousarray(matrix.closes)
-                v = np.ascontiguousarray(matrix.volumes)
-                h = np.ascontiguousarray(matrix.highs)
-                l = np.ascontiguousarray(matrix.lows)
-            
+                closes = np.ascontiguousarray(matrix.closes)
+                volumes = np.ascontiguousarray(matrix.volumes)
+                highs = np.ascontiguousarray(matrix.highs)
+                lows = np.ascontiguousarray(matrix.lows)
+
+                # Outputs are the pre-allocated arrays on the matrix itself.
+                out_rsi = matrix.rsi
+                out_mfi = matrix.mfi
+                out_adx = matrix.adx
+                out_vol_z = matrix.vol_z
+                out_atr = matrix.atr
+
+            # Heavy math outside the lock to minimize blocking writers
             calc_indicators_inplace(
-                c, v, h, l, 
-                matrix.rsi, matrix.mfi, matrix.adx, matrix.vol_z
+                closes, volumes, highs, lows,
+                out_rsi, out_mfi, out_adx, out_vol_z, out_atr
             )
+            matrix.last_calc_time = time.time()
         except Exception as e:
-            logger.error(f"Indicator Job Failed: {e}")
+            logger.error(f"Indicator Job Failed for timeframe {matrix.timeframe}: {e}", exc_info=True)
 
     async def calculation_loop(self):
         logger.info("Starting Math Loop")
+
+        loop = asyncio.get_running_loop()
+
         while self.running:
             start = time.time()
-            futures = [
-                self.executor.submit(self._update_indicators_job, m) 
-                for m in self.matrices.values()
-            ]
+
+            # Submit one job per timeframe matrix
+            futures = []
+            for m in self.matrices.values():
+                # Skip empty matrices (no symbols yet)
+                if m.n_symbols == 0:
+                    continue
+                futures.append(loop.run_in_executor(self.executor, self._update_indicators_job, m))
+
             if futures:
-                await asyncio.gather(*[asyncio.wrap_future(f) for f in futures])
-            
+                # Wait for all indicator jobs to finish
+                try:
+                    await asyncio.gather(*futures)
+                except Exception as e:
+                    logger.error(f"Error in calculation_loop gather: {e}", exc_info=True)
+
             elapsed = time.time() - start
+            # Target ~1s cycle, never negative sleep
             await asyncio.sleep(max(0.1, 1.0 - elapsed))
+
 
     def _save_to_disk_thread(self):
         try:
@@ -1553,78 +1698,148 @@ class BinanceMarketDataCollector:
             await asyncio.sleep(60)
             await asyncio.get_running_loop().run_in_executor(self.executor, self._save_to_disk_thread)
 
-    async def health_log_task(self):
+    async def health_log_task(self):        
+        import psutil  # Ensure psutil is installed
+        process = psutil.Process(os.getpid())
+        
         while self.running:
-            await asyncio.sleep(300)
+            await asyncio.sleep(60)
             try:
-                tf = ['1m', '5m', '15m', '1h', '4h', '1d']
-
-                active_tfs = []
-                total_symbols = 0
-
-                for t in tf:
-                    if t in self.matrices:
-                        active_tfs.append(t)
-                        total_symbols += self.matrices[t].n_symbols
-
-                count = len(active_tfs)
-                tf_list = ", ".join(active_tfs)
-
+                # 1. System Resources (CPU & Memory)
+                # cpu_percent(interval=None) returns float representing CPU utilization as a percentage
+                # First call might return 0.0, subsequent calls return avg utilization since last call.
+                cpu_usage = process.cpu_percent(interval=None)
+                mem_mb = process.memory_info().rss / 1024 / 1024
+                
+                # 2. System Lag (Math Loop)
+                now = time.time()
+                lags = []
+                for tf, m in self.matrices.items():
+                    lag = now - m.last_calc_time
+                    lags.append(f"{tf}:{lag:.1f}s")
+                
+                lag_str = " | ".join(lags)
+                
+                # 3. Liquidity & Futures
+                liq_count = len(self.liq_monitor.history) if self.liq_monitor else 0
+                total_symbols = sum(m.n_symbols for m in self.matrices.values())
+                
                 logger.info(
-                    f"Health: {count} matrices active, total symbols = {total_symbols}. "
-                    f"Active TFs: {tf_list}"
+                    f"💚 HEALTH | CPU: {cpu_usage:.1f}% | Mem: {mem_mb:.0f}MB | "
+                    f"Sym: {total_symbols} | "
+                    f"LiqEvents: {liq_count} | "
+                    f"Calc Lag: [{lag_str}]"
                 )
+            except Exception as e:
+                logger.error(f"Health check error: {e}")
 
-            except Exception:
-                pass
 
+            
+    async def gap_check_task(self):
+        """Runs every 60s to fix silent symbols."""
+        while self.running:
+            await asyncio.sleep(60)
+            try:
+                for matrix in self.matrices.values():
+                    # Run the heavy check in a thread to avoid blocking loop
+                    await asyncio.get_running_loop().run_in_executor(
+                        self.executor, matrix.check_and_fill_gaps
+                    )
+            except Exception as e:
+                logger.error(f"Gap check failed: {e}")
 
     async def run(self):
         logger.info("🚀 Data Collector Starting...")
         force_refresh = env_flag("FORCE_REFRESH")
 
-        if not force_refresh and await self.load_state():
-            pass
-        else:
-            await self.fetch_top_coins()
-            await self.fetch_historical_snapshot()
-        self.liq_history_loader = LiquidationHistoryLoader(
-            liq_monitor=self.liq_monitor,
-            symbols=self.top_coins
-        )
-        # ← ADD THIS: Initialize futures data collector
-        self.futures_collector = FuturesDataCollector(
-            symbols=self.top_coins,
-            matrices=self.matrices
-        )
-        self.depth_liquidity_collector = DepthLiquidityCollector(
-            symbols=self.top_coins,
-            matrices=self.matrices
-        )
-        tasks = []
-        all_streams = []
-        for s in self.top_coins:
-            for tf in self.active_timeframes:
-                all_streams.append(f"{s.lower()}@kline_{tf}")
-                
-        chunks = [all_streams[i:i + 200] for i in range(0, len(all_streams), 200)]
-        for i, chunk in enumerate(chunks):
-            tasks.append(asyncio.create_task(self._single_futures_kline_handler(chunk, i)))
-
-        tasks.append(asyncio.create_task(self.calculation_loop()))
-        tasks.append(asyncio.create_task(self.periodic_save_task()))
-        tasks.append(asyncio.create_task(self.health_log_task()))
-        tasks.append(asyncio.create_task(self.symbol_refresh_task()))  # ← ADD THIS LINE
-        tasks.append(asyncio.create_task(self.liq_history_loader.start()))
-        tasks.append(asyncio.create_task(self.futures_collector.run()))
-        tasks.append(asyncio.create_task(self.depth_liquidity_collector.run()))
-
         try:
+            # 1) Load or warmup
+            state_loaded = False
+            if not force_refresh:
+                state_loaded = await self.load_state()
+
+            if not state_loaded:
+                await self.fetch_top_coins()
+                await self.fetch_historical_snapshot()
+            elif not self.top_coins:
+                # If state loaded but top_coins empty, derive from one matrix
+                if self.matrices:
+                    any_tf = next(iter(self.matrices))
+                    self.top_coins = self.matrices[any_tf].symbols
+                else:
+                    await self.fetch_top_coins()
+
+            # Safety: ensure matrices exist for all active TFs
+            for tf in self.active_timeframes:
+                if tf not in self.matrices:
+                    self.matrices[tf] = MarketMatrix(self.top_coins, tf)
+
+            # 2) Initialize side collectors AFTER symbols & matrices are ready
+            self.liq_history_loader = LiquidationHistoryLoader(
+                liq_monitor=self.liq_monitor,
+                symbols=self.top_coins
+            )
+
+            self.futures_collector = FuturesDataCollector(
+                symbols=self.top_coins,
+                matrices=self.matrices
+            )
+
+            self.depth_liquidity_collector = DepthLiquidityCollector(
+                symbols=self.top_coins,
+                matrices=self.matrices
+            )
+
+            # 3) Build kline streams
+            all_streams = []
+            for s in self.top_coins:
+                sym_l = s.lower()
+                for tf in self.active_timeframes:
+                    all_streams.append(f"{sym_l}@kline_{tf}")
+
+            chunks = [all_streams[i:i + 200] for i in range(0, len(all_streams), 200)]
+
+            tasks = []
+
+            # 4) Start kline handlers
+            for i, chunk in enumerate(chunks):
+                tasks.append(asyncio.create_task(
+                    self._single_futures_kline_handler(chunk, i),
+                    name=f"kline_ws_{i}"
+                ))
+
+            # 5) Start core internal loops
+            tasks.append(asyncio.create_task(self.calculation_loop(), name="calc_loop"))
+            tasks.append(asyncio.create_task(self.periodic_save_task(), name="save_loop"))
+            tasks.append(asyncio.create_task(self.health_log_task(), name="health_loop"))
+            tasks.append(asyncio.create_task(self.symbol_refresh_task(), name="symbol_refresh"))
+
+            # 6) Start external data collectors
+            tasks.append(asyncio.create_task(self.liq_history_loader.start(), name="liq_history"))
+            tasks.append(asyncio.create_task(self.futures_collector.run(), name="futures_collector"))
+            tasks.append(asyncio.create_task(self.depth_liquidity_collector.run(), name="depth_collector"))
+            tasks.append(asyncio.create_task(self.gap_check_task(), name="gap_check"))
+            # 7) Run all
             await asyncio.gather(*tasks)
+
         except Exception as e:
-            logger.critical(f"Main Loop Crash: {e}")
+            logger.critical(f"Main Loop Crash: {e}", exc_info=True)
         finally:
+            self.stop()
             self.executor.shutdown(wait=False)
+            logger.info("Data Collector stopped.")
+
+    def stop(self):
+        self.running = False
+        if self.depth_liquidity_collector:
+            self.depth_liquidity_collector.running = False
+        if self.futures_collector:
+            self.futures_collector.running = False
+        if self.liq_monitor:
+            self.liq_monitor.running = False
+        if self.liq_history_loader:
+            self.liq_history_loader.running = False
+
 
 if __name__ == "__main__":
     bot = BinanceMarketDataCollector()
